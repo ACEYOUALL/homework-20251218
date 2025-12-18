@@ -77,3 +77,15 @@ del raw_data
 del norm_data
 del batches
 del embedded_E
+
+# （3）编码层
+
+# 层归一化
+def layer_norm(Z, gamma, beta):
+    mean = np.mean(Z, axis=-1, keepdims=True)
+    std = np.std(Z, axis=-1, keepdims=True)
+    norm_Z = (Z-mean)/(std+1e-6)
+    retval = gamma*norm_Z+beta
+    return retval
+
+print(embedded_Z[0].shape)
