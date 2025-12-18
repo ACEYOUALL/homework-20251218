@@ -96,7 +96,7 @@ h = 8
 d_k = d_model//h
 d_v = d_k
 
-# 初始化权重参数，维度是 d_model×d_model
+# Xavier 方法初始化权重参数，维度是 d_model×d_model
 W_Q = np.random.randn(d_model, d_model)*np.sqrt(1.0/d_model)
 W_K = np.random.randn(d_model, d_model)*np.sqrt(1.0/d_model)
 W_V = np.random.randn(d_model, d_model)*np.sqrt(1.0/d_model)
@@ -104,7 +104,7 @@ W_V = np.random.randn(d_model, d_model)*np.sqrt(1.0/d_model)
 # 初始化多头拼接后的输出权重，维度 d_model×d_model
 W_O = np.random.randn(d_model, d_model)*np.sqrt(1.0/d_model)
 
-# 缩放点积注意力函数（查询、键、值）
+# 缩放点积注意力（查询、键、值）
 def scaled_dot_product_attention(Q, K, V):
     # 注意力得分 QK^T，K 转置最后两维
     attention_scores = np.matmul(Q, K.transpose(0,2,1))
@@ -114,5 +114,47 @@ def scaled_dot_product_attention(Q, K, V):
     attention_weights = np.exp(attention_scores)/np.sum(np.exp(attention_scores), axis=-1, keepdims=True)
     # 权重乘以 V（维度是 B×τ×d_v ），得到单头输出，维度是 B×τ×d_v
     output = np.matmul(attention_weights, V)
-    return output
+    return output,attention_weights
 
+# 多头注意力实现部分
+def multi_head_attention(Z, W_Q, W_K, W_V, W_O):
+    #  W_Q、W_K、W_V、W_O 维度均是 d_model×d_model
+    
+    # 获取批次大小和时间步
+    B,tau,_ = Z.shape
+    
+    # 计算 Q、K、V ，维度是 B×τ×d_model
+    Q = np.matmul(Z,W_Q)
+    K = np.matmul(Z,W_K)
+    V = np.matmul(Z,W_V)
+    
+    # 将每个头分离开来，变成维度是 B×h×τ×d_k
+    Q_split = Q.reshape(B,tau,h,d_k).transpose(0,2,1,3)
+    K_split = K.reshape(B,tau,h,d_k).transpose(0,2,1,3)
+    V_split = V.reshape(B,tau,h,d_v).transpose(0,2,1,3)
+    
+    # 单头注意力结果
+    head_outputs = []
+    # 每个头的注意力权重
+    attention_weights = []
+    
+    # 遍历每个头
+    for i in range(h):
+        
+        # 维度是 B×τ×d_k
+        Q_i = Q_split[:,i,:,:]
+        K_i = K_split[:,i,:,:]
+        V_i = V_split[:,i,:,:]
+        
+        # 计算单头注意力
+        head_outputs_, attention_weights_ = scaled_dot_product_attention(Q_i, K_i, V_i)
+        head_outputs.append(head_outputs_)            # B×τ×d_v
+        attention_weights.append(attention_weights_)  # B×τ×τ
+        
+    # 将多头结果拼接
+    concat_head_outputs = np.concatenate(head_outputs, axis=-1)  # B×τ×(d_v·h) → B×τ×d_model
+    
+    # 最后乘 W_O 线性变换整合
+    multi_head_outputs = np.matmul(concat_head_outputs, W_O)  # B×τ×d_model
+    
+    return multi_head_outputs,attention_weights
