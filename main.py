@@ -15,8 +15,8 @@ tau = 10
 
 # 切分滑动窗口得到训练样本
 tmp_samples = []
-for i in range(raw_data.shape[0]-tau+1):
-    sample = raw_data[i:i+tau,:]
+for i in range(norm_data.shape[0]-tau+1):
+    sample = norm_data[i:i+tau,:]
     tmp_samples.append(sample)
 samples = np.array(tmp_samples)
 del tmp_samples
