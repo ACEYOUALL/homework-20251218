@@ -85,7 +85,34 @@ def layer_norm(Z, gamma, beta):
     mean = np.mean(Z, axis=-1, keepdims=True)
     std = np.std(Z, axis=-1, keepdims=True)
     norm_Z = (Z-mean)/(std+1e-6)
-    retval = gamma*norm_Z+beta
-    return retval
+    output = gamma*norm_Z+beta
+    return output
 
-print(embedded_Z[0].shape)
+# 多头注意力机制
+
+# 超参数：头数（d_model%h==0）
+h = 8
+# 单头维度
+d_k = d_model//h
+d_v = d_k
+
+# 初始化权重参数，维度是 d_model×d_model
+W_Q = np.random.randn(d_model, d_model)*np.sqrt(1.0/d_model)
+W_K = np.random.randn(d_model, d_model)*np.sqrt(1.0/d_model)
+W_V = np.random.randn(d_model, d_model)*np.sqrt(1.0/d_model)
+
+# 初始化多头拼接后的输出权重，维度 d_model×d_model
+W_O = np.random.randn(d_model, d_model)*np.sqrt(1.0/d_model)
+
+# 缩放点积注意力函数（查询、键、值）
+def scaled_dot_product_attention(Q, K, V):
+    # 注意力得分 QK^T，K 转置最后两维
+    attention_scores = np.matmul(Q, K.transpose(0,2,1))
+    # 缩放，避免 attention_score 太大导致 softmax 梯度消失
+    attention_scores = attention_scores/np.sqrt(d_k)
+    # softmax 计算注意力权重，并归一化（按最后一维，权重之和等于 1 ），维度是 B×τ×τ
+    attention_weights = np.exp(attention_scores)/np.sum(np.exp(attention_scores), axis=-1, keepdims=True)
+    # 权重乘以 V（维度是 B×τ×d_v ），得到单头输出，维度是 B×τ×d_v
+    output = np.matmul(attention_weights, V)
+    return output
+
