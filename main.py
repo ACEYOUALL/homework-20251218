@@ -49,4 +49,20 @@ for _,X in enumerate(batches):
     # 做线性投影
     E = X@W_ref+b_ref
     embedded_E.append(E)
-print(len(embedded_E)==len(batches))
+
+# Transformer 标准的位置编码方式
+
+# 生成位置索引，增加维数到 τ×1
+pos = np.arange(tau)[:, np.newaxis]
+# 序，长度 d_model/2
+i = np.arange(0, d_model, 2)
+# 分母
+div_term = np.exp(i*(-np.log(10000.0)/d_model))
+# 位置编码矩阵，维数 τ×d_model
+PE = np.zeros((tau, d_model))
+PE[:, 0::2] = np.sin(pos*div_term)  # 偶数维度
+PE[:, 1::2] = np.cos(pos*div_term)  # 奇数维度
+
+print(PE.shape)
+print(PE[0, :5])
+print(PE[1, :5])
