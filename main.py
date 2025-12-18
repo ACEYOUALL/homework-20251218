@@ -1,6 +1,8 @@
 import numpy as np
 import pandas as pd
 
+# （1）数据预处理
+
 # 读取训练数据集
 raw_data = pd.read_csv("./data/training_set.csv", usecols=["AT", "EV", "AP", "RH", "PE"], encoding="utf-8").dropna().values
 
@@ -27,3 +29,18 @@ batches = []
 for i in range(0, len(samples), B):
     batch = samples[i:i+B]
     batches.append(batch)
+
+# （2）特征嵌入层
+
+# 超参数：嵌入维度
+d_model = 64
+# 原始输入维度
+d_raw = 5
+'''d_raw = raw_data.shape[1]'''
+# Xavier 方法初始化权重，标准差 sqrt(1/5)
+W_emb = np.random.randn(d_raw, d_model)*np.sqrt(1.0/d_raw)
+# 初始化偏置，全零
+b_emb = np.zeros(d_model)
+
+print(W_emb.shape)
+print(b_emb.shape)
