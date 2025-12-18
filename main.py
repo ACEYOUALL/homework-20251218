@@ -42,11 +42,11 @@ d_raw = 5
 W_ref = np.random.randn(d_raw, d_model)*np.sqrt(1.0/d_raw)
 # 初始化偏置，全零
 b_ref = np.zeros(d_model)
-# 内嵌线性投影矩阵
 
+# 内嵌线性投影矩阵
 embedded_E = []
-for X in enumerate(batches):
+for _,X in enumerate(batches):
     # 做线性投影
     E = X@W_ref+b_ref
     embedded_E.append(E)
-print(embedded_E[-1].shape)
+print(len(embedded_E)==len(batches))
