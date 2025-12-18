@@ -6,7 +6,7 @@ import pandas as pd
 # 读取训练数据集
 raw_data = pd.read_csv("./data/training_set.csv", usecols=["AT", "EV", "AP", "RH", "PE"], encoding="utf-8").dropna().values
 
-# Z-score 标准化
+# Z-score 归一化（时间维度）
 mean = np.mean(raw_data, axis=0)
 std = np.std(raw_data, axis=0)
 norm_data = (raw_data-mean)/(std+1e-8)
@@ -80,7 +80,7 @@ del embedded_E
 
 # （3）编码层
 
-# 层归一化
+# 层归一化（单样本，按特征维度 d_model ）
 def layer_norm(Z, gamma, beta):
     mean = np.mean(Z, axis=-1, keepdims=True)
     std = np.std(Z, axis=-1, keepdims=True)
