@@ -72,6 +72,8 @@ for _,E in enumerate(embedded_E):
     Z = E+PE
     embedded_Z.append(Z)
 
-print(len(embedded_Z))
-print(embedded_Z[0].shape)
-print(embedded_Z[-1].shape)
+# 回收内存
+del raw_data
+del norm_data
+del batches
+del embedded_E
