@@ -43,7 +43,7 @@ W_ref = np.random.randn(d_raw, d_model)*np.sqrt(1.0/d_raw)
 # 初始化偏置，全零
 b_ref = np.zeros(d_model)
 
-# 内嵌线性投影矩阵
+# 内嵌线性投影序列，维度 B×τ×d_model
 embedded_E = []
 for _,X in enumerate(batches):
     # 做线性投影
@@ -54,15 +54,24 @@ for _,X in enumerate(batches):
 
 # 生成位置索引，增加维数到 τ×1
 pos = np.arange(tau)[:, np.newaxis]
-# 序，长度 d_model/2
+# 索引子序，长度 d_model/2
 i = np.arange(0, d_model, 2)
 # 分母
 div_term = np.exp(i*(-np.log(10000.0)/d_model))
-# 位置编码矩阵，维数 τ×d_model
+# 位置编码序列，维数 τ×d_model
 PE = np.zeros((tau, d_model))
 PE[:, 0::2] = np.sin(pos*div_term)  # 偶数维度
 PE[:, 1::2] = np.cos(pos*div_term)  # 奇数维度
 
-print(PE.shape)
-print(PE[0, :5])
-print(PE[1, :5])
+# 注入位置编码
+
+# 输入嵌入序列，维度 B×τ×d_model
+embedded_Z = []
+for _,E in enumerate(embedded_E):
+    # 线性叠加
+    Z = E+PE
+    embedded_Z.append(Z)
+
+print(len(embedded_Z))
+print(embedded_Z[0].shape)
+print(embedded_Z[-1].shape)
