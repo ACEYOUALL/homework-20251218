@@ -192,3 +192,34 @@ def feed_forward_network(Z, W1, b1, W2, b2):
     # 线性变换，维度压缩回 d_model
     L2 = np.matmul(A, W2)+b2
     return L2
+
+# 残差连接
+
+# 层归一化参数
+ln_gamma = np.ones(d_model)
+ln_beta = np.zeros(d_model)
+
+# 编码层输出
+encoder_outputs = []
+
+print()
+
+# Transformer 编码层含两次残差连接
+for batch in embedded_Z:
+    # 第一次
+    # 计算多头注意力（子层输出）
+    multi_head_outputs,attention_weights = multi_head_attention(batch, W_Q, W_K, W_V, W_O)
+    # 残差连接，B×τ×d_model
+    residual1 = batch+multi_head_outputs
+    # 层归一化
+    ln1_output = layer_norm(residual1, ln_gamma, ln_beta)
+    
+    # 第二次
+    # 计算前馈网络（子层输出）
+    ffn_outputs = feed_forward_network(ln1_output, W1, b1, W2, b2)
+    # 残差连接，B×τ×d_model
+    residual2 = ln1_output+ffn_outputs
+    # 层归一化
+    ln2_output = layer_norm(residual2, ln_gamma, ln_beta)
+    
+    encoder_outputs.append(ln2_output)
