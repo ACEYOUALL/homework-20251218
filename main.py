@@ -182,3 +182,13 @@ def swish(x, beta=1.0):
 # ReLU 激活函数
 def relu(x):
     return np.maximum(0, x)
+
+# 实现前馈网络
+def feed_forward_network(Z, W1, b1, W2, b2):
+    # 线性变换，维度拓展至 d_ff
+    L1 = np.matmul(Z, W1)+b1
+    # 激活函数
+    A = swish(L1)
+    # 线性变换，维度压缩回 d_model
+    L2 = np.matmul(A, W2)+b2
+    return L2
