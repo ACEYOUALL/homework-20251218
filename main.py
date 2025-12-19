@@ -223,3 +223,17 @@ for batch in embedded_Z:
     ln2_output = layer_norm(residual2, ln_gamma, ln_beta)
     
     encoder_outputs.append(ln2_output)
+
+if __name__ == "__main__":
+    test_batch = embedded_Z[0]
+    print(test_batch.shape)
+    
+    mh_out,attn_w = multi_head_attention(test_batch, W_Q, W_K, W_V, W_O)
+    residual1 = test_batch+mh_out
+    ln1_out = layer_norm(residual1, ln_gamma, ln_beta)
+    print(ln1_out.shape)
+    
+    ffn_out = feed_forward_network(ln1_out, W1, b1, W2, b2)
+    residual2 = ln1_out+ffn_out
+    ln2_out = layer_norm(residual2, ln_gamma, ln_beta)
+    print(ln2_out.shape)
