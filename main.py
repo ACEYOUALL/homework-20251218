@@ -158,3 +158,15 @@ def multi_head_attention(Z, W_Q, W_K, W_V, W_O):
     multi_head_outputs = np.matmul(concat_head_outputs, W_O)  # B×τ×d_model
     
     return multi_head_outputs,attention_weights
+
+test_Z = embedded_Z[0]
+print(test_Z.shape)
+mh_out,mh_aw = multi_head_attention(test_Z, W_Q, W_K, W_V, W_O)
+print(mh_out.shape)
+print(len(mh_aw))
+print(mh_aw[0].shape)
+
+sample_idx = 0
+head_idx = 0
+weight_sum = np.sum(mh_aw[head_idx][sample_idx], axis=-1)
+print(np.round(weight_sum, 4))
