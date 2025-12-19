@@ -173,3 +173,12 @@ b1 = np.zeros(d_ff)
 W2 = np.random.randn(d_ff, d_model)*np.sqrt(1.0 / d_ff)
 # 初始化第二层偏置，全零
 b2 = np.zeros(d_model)
+
+# Swish 激活函数
+def swish(x, beta=1.0):
+    sigmoid = 1/(1+np.exp(-beta*x))
+    return x*sigmoid
+
+# ReLU 激活函数
+def relu(x):
+    return np.maximum(0, x)
