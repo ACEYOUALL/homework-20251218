@@ -159,14 +159,17 @@ def multi_head_attention(Z, W_Q, W_K, W_V, W_O):
     
     return multi_head_outputs,attention_weights
 
-test_Z = embedded_Z[0]
-print(test_Z.shape)
-mh_out,mh_aw = multi_head_attention(test_Z, W_Q, W_K, W_V, W_O)
-print(mh_out.shape)
-print(len(mh_aw))
-print(mh_aw[0].shape)
+# 前馈网络
 
-sample_idx = 0
-head_idx = 0
-weight_sum = np.sum(mh_aw[head_idx][sample_idx], axis=-1)
-print(np.round(weight_sum, 4))
+# 超参数：中间层维度（取 8 倍 d_model，满足 d_ff >> d_model）
+d_ff = 512
+
+# Xavier 方法初始化第一层权重
+W1 = np.random.randn(d_model, d_ff)*np.sqrt(1.0/d_model)
+# 初始化第一层偏置，全零
+b1 = np.zeros(d_ff)
+
+# Xavier 方法初始化第二层权重
+W2 = np.random.randn(d_ff, d_model)*np.sqrt(1.0 / d_ff)
+# 初始化第二层偏置，全零
+b2 = np.zeros(d_model)
