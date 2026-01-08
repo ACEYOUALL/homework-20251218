@@ -168,9 +168,9 @@ for batch in Z:
 W_pred = np.random.randn(d_model,1)*np.sqrt(1.0/d_model)
 b_pred = np.zeros(1)
 
-# 预测值 (B,)
+# 存储预测值 (B,)
 predictions = []
-# 真实标签 (B,)
+# 存储真实标签 (B,)
 true_labels = []
 
 # 回归预测头
@@ -185,3 +185,16 @@ for i,out in enumerate(outs_ENC):
     # 储存
     predictions.append(y_pred)
     true_labels.append(label)
+    
+# 计算平均 MSE 损失
+total_loss = 0.0
+total_samples = 0
+for y_pred,y_true in zip(predictions,true_labels):
+    total_loss += np.mean((y_pred-y_true)**2)*len(y_true)
+    total_samples += len(y_true)
+mse_loss = total_loss/total_samples
+
+print(f"Initial MSE Loss: {mse_loss:.6f}")
+
+assert isinstance(mse_loss, float), "Loss should be a scalar"
+print("✅ Loss computed successfully.")
