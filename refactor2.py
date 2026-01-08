@@ -3,7 +3,7 @@ import pandas as pd
 import time
 import os
 
-# 确保模型目录存在
+# 创建模型保存目录
 os.makedirs("./model", exist_ok=True)
 
 # ------------------------------------------------------------------
@@ -24,7 +24,7 @@ norm_seq_X = (seq_X-mean_X)/(std_X+1e-8)
 norm_seq_Y = (seq_Y-mean_Y)/(std_Y+1e-8)
 
 # 超参数：滑动窗口长度 τ
-tau = 10
+tau = 5
 
 # 样本和标签
 samples = []  # (τ,4)
@@ -34,7 +34,7 @@ for i in range(len(norm_seq_X)-tau):
     labels.append(norm_seq_Y[i+tau])
 
 # 超参数：批量 B
-B = 32
+B = 8
 
 # 准备样本和标签批次
 sample_batches = []  # (B,τ,4)
@@ -49,7 +49,7 @@ for i in range(0,len(labels),B):
 # ------------------------------------------------------------------
 
 # 超参数：嵌入维度 d_model
-d_model = 128
+d_model = 64
 
 # 超参数：输入维度 d_in
 d_in = 4
@@ -190,20 +190,20 @@ def FFN(Z, W_1, b_1, W_2, b_2):
     return L_2, L_1, A  # 返回中间变量用于反向传播
 
 # ------------------------------------------------------------------
-# （4）训练循环
+# （4）训练循环（AdamW 优化器）
 # ------------------------------------------------------------------
 
 # 超参数
-num_epochs = 100
-initial_lr = 0.01   # AdamW 通常使用更小的初始学习率
-final_lr = 1e-5     # 最终学习率
-weight_decay = 0.05 # AdamW 的权重衰减（通常比 SGD 大）
-clip_value = 1.0    # 梯度裁剪阈值
-beta1 = 0.9         # Adam 一阶矩衰减
-beta2 = 0.999       # Adam 二阶矩衰减
-epsilon = 1e-8      # 数值稳定常数
+num_epochs = 30
+initial_lr = 0.001  # AdamW 通常用较小学习率
+final_lr = 1e-6     # 最终学习率
+weight_decay = 1e-2 # AdamW 的权重衰减
+beta1 = 0.9         # 一阶矩估计衰减
+beta2 = 0.999       # 二阶矩估计衰减
+epsilon = 1e-8      # 数值稳定项
+clip_value = 10.0    # 梯度裁剪阈值
 
-# 初始化 AdamW 状态
+# AdamW 状态初始化（一阶矩 m，二阶矩 v）
 m = {
     'W_e': np.zeros_like(W_e),
     'b_e': np.zeros_like(b_e),
@@ -238,7 +238,15 @@ v = {
     'b_pred': np.zeros_like(b_pred)
 }
 
-t = 0  # 优化器时间步
+# 时间步（全局）
+t = 0
+
+# 权重衰减参数列表（只对权重应用）
+weight_params = ['W_e', 'W_Q', 'W_K', 'W_V', 'W_O', 'W_1', 'W_2', 'W_pred']
+param_dict = {
+    'W_e': W_e, 'W_Q': W_Q, 'W_K': W_K, 'W_V': W_V, 'W_O': W_O,
+    'W_1': W_1, 'W_2': W_2, 'W_pred': W_pred
+}
 
 print("开始训练 (AdamW 优化器)...")
 for epoch in range(num_epochs):
@@ -246,15 +254,14 @@ for epoch in range(num_epochs):
     total_loss = 0.0
     total_samples = 0
     
-    # 余弦退火学习率
+    # 余弦退火学习率调度
     lr = final_lr + 0.5 * (initial_lr - final_lr) * (1 + np.cos(np.pi * epoch / num_epochs))
     
-    # 随机打乱批次顺序（提高泛化）
+    # 随机打乱批次顺序
     batch_indices = np.random.permutation(len(sample_batches))
     
     for batch_idx in batch_indices:
-        t += 1  # 时间步递增
-        
+        t += 1  # 全局时间步增加
         X_batch = sample_batches[batch_idx]  # (B, τ, 4)
         y_true = label_batches[batch_idx]   # (B,)
         B_actual = X_batch.shape[0]
@@ -278,7 +285,7 @@ for epoch in range(num_epochs):
         res_1 = Z_batch + outs_MHA
         outs_LN_1 = LayerNorm(res_1, gamma, beta)
         
-        # 前馈网络（保存中间变量）
+        # 前馈网络
         outs_FFN, L_1, A = FFN(outs_LN_1, W_1, b_1, W_2, b_2)
         
         # 第二次残差连接 + 层归一化
@@ -336,7 +343,7 @@ for epoch in range(num_epochs):
         dL_douts_FFN = dL_dres2.copy()
         
         # FFN 反向传播
-        # (a) 第二层：L_2 = A @ W_2 + b_2
+        # (a) 第二层
         dL_dL2 = dL_douts_FFN
         grads['W_2'] = A.reshape(-1, d_ff).T @ dL_dL2.reshape(-1, d_model)
         grads['b_2'] = np.sum(dL_dL2, axis=(0,1))
@@ -344,12 +351,12 @@ for epoch in range(num_epochs):
         dL_dA = dL_dL2.reshape(-1, d_model) @ W_2.T
         dL_dA = dL_dA.reshape(B_actual, tau, d_ff)
         
-        # (b) Swish 激活函数（正确梯度）
+        # (b) Swish 激活函数
         sigmoid_L1 = 1.0 / (1.0 + np.exp(-L_1))
-        dSwish_dL1 = sigmoid_L1 * (1 + L_1 * (1 - sigmoid_L1))  # ✅ 正确公式
+        dSwish_dL1 = sigmoid_L1 * (1 + L_1 * (1 - sigmoid_L1))
         dL_dL1 = dL_dA * dSwish_dL1
         
-        # (c) 第一层：L_1 = outs_LN_1 @ W_1 + b_1
+        # (c) 第一层
         grads['W_1'] = outs_LN_1.reshape(-1, d_model).T @ dL_dL1.reshape(-1, d_ff)
         grads['b_1'] = np.sum(dL_dL1, axis=(0,1))
 
@@ -390,15 +397,15 @@ for epoch in range(num_epochs):
             Q_i = Q_iso[:, i, :, :]   # (B, τ, d_K)
             K_i = K_iso[:, i, :, :]   # (B, τ, d_K)
             
-            # (i) V 梯度: dL/dV = AW^T @ dL_dout
+            # (i) V 梯度
             dL_dV_i = np.matmul(AW_i.transpose(0,2,1), dL_dout_i)  # (B, τ, d_K)
             
-            # (ii) AW 梯度: dL/dAW = dL_dout @ V^T
+            # (ii) AW 梯度
             dL_dAW = np.matmul(dL_dout_i, V_i.transpose(0,2,1))  # (B, τ, τ)
             
-            # (iii) AS 梯度 (softmax 完整导数) ✅
+            # (iii) AS 梯度 (softmax 完整导数)
             sum_term = np.sum(dL_dAW * AW_i, axis=-1, keepdims=True)  # (B, τ, 1)
-            dL_dAS = AW_i * (dL_dAW - sum_term)  # (B, τ, τ) ✅ 正确公式
+            dL_dAS = AW_i * (dL_dAW - sum_term)  # (B, τ, τ)
             
             # (iv) Q, K 梯度
             dL_dQ_i = np.matmul(dL_dAS, K_i) / np.sqrt(d_K)  # (B, τ, d_K)
@@ -421,14 +428,14 @@ for epoch in range(num_epochs):
         grads['b_e'] = np.sum(dL_dE_batch, axis=(0,1))
         
         # ------------------------------------------------------------------
-        # AdamW 优化（梯度裁剪 + 权重衰减 + 自适应更新）
+        # 优化（AdamW）
         # ------------------------------------------------------------------
         
         # 安全的梯度裁剪函数
         def safe_clip(grad, min_val, max_val):
             if isinstance(grad, np.ndarray):
                 if grad.size > 1:  # 非标量数组
-                    return np.clip(grad, min_val, max_val, out=grad.copy())
+                    return np.clip(grad, min_val, max_val)
                 else:  # 标量数组
                     return np.array(np.clip(grad.item(), min_val, max_val))
             else:  # Python 标量
@@ -438,68 +445,56 @@ for epoch in range(num_epochs):
         for param_name, grad in grads.items():
             grads[param_name] = safe_clip(grad, -clip_value, clip_value)
         
-        # 获取当前参数值的字典
-        param_dict = {
-            'W_e': W_e, 'b_e': b_e,
-            'W_Q': W_Q, 'W_K': W_K, 'W_V': W_V, 'W_O': W_O,
-            'W_1': W_1, 'b_1': b_1, 'W_2': W_2, 'b_2': b_2,
-            'gamma': gamma, 'beta': beta,
-            'W_pred': W_pred, 'b_pred': b_pred
-        }
-        
-        # 对每个参数进行 AdamW 更新
+        # AdamW 参数更新
         for param_name in grads.keys():
             g = grads[param_name]
-            param = param_dict[param_name]
+            param_old = eval(param_name)
             
-            # 1. 更新一阶矩和二阶矩估计
+            # 更新一阶矩和二阶矩
             m[param_name] = beta1 * m[param_name] + (1 - beta1) * g
             v[param_name] = beta2 * v[param_name] + (1 - beta2) * (g ** 2)
             
-            # 2. 偏差修正
+            # 偏差修正
             m_hat = m[param_name] / (1 - beta1 ** t)
             v_hat = v[param_name] / (1 - beta2 ** t)
             
-            # 3. AdamW 更新规则（解耦权重衰减）
-            if param_name in ['W_e', 'W_Q', 'W_K', 'W_V', 'W_O', 'W_1', 'W_2', 'W_pred']:
-                # 权重参数：解耦权重衰减
-                update = lr * (m_hat / (np.sqrt(v_hat) + epsilon) + weight_decay * param)
+            # AdamW 更新规则
+            if param_name in weight_params:
+                # 解耦权重衰减
+                update = lr * (m_hat / (np.sqrt(v_hat) + epsilon) + weight_decay * param_old)
             else:
-                # 偏置和层归一化参数：无权重衰减
+                # 无权重衰减
                 update = lr * (m_hat / (np.sqrt(v_hat) + epsilon))
             
-            # 4. 应用更新
-            param -= update
-            
-            # 5. 更新全局变量
+            # 应用更新
             if param_name == 'W_e':
-                W_e = param
+                W_e -= update
             elif param_name == 'b_e':
-                b_e = param
+                b_e -= update
             elif param_name == 'W_Q':
-                W_Q = param
+                W_Q -= update
             elif param_name == 'W_K':
-                W_K = param
+                W_K -= update
             elif param_name == 'W_V':
-                W_V = param
+                W_V -= update
             elif param_name == 'W_O':
-                W_O = param
+                W_O -= update
             elif param_name == 'W_1':
-                W_1 = param
+                W_1 -= update
             elif param_name == 'b_1':
-                b_1 = param
+                b_1 -= update
             elif param_name == 'W_2':
-                W_2 = param
+                W_2 -= update
             elif param_name == 'b_2':
-                b_2 = param
+                b_2 -= update
             elif param_name == 'gamma':
-                gamma = param
+                gamma -= update
             elif param_name == 'beta':
-                beta = param
+                beta -= update
             elif param_name == 'W_pred':
-                W_pred = param
+                W_pred -= update
             elif param_name == 'b_pred':
-                b_pred = param
+                b_pred -= update
     
     # 计算平均损失
     avg_loss = total_loss / total_samples
@@ -512,7 +507,7 @@ print("训练完成！")
 # （5）模型保存
 # ------------------------------------------------------------------
 print("\n保存模型参数...")
-np.savez("./model/transformer_params_adamw.npz",
+np.savez("./model/transformer_params.npz",
          W_e=W_e, b_e=b_e,
          W_Q=W_Q, W_K=W_K, W_V=W_V, W_O=W_O,
          W_1=W_1, b_1=b_1, W_2=W_2, b_2=b_2,
@@ -520,4 +515,4 @@ np.savez("./model/transformer_params_adamw.npz",
          W_pred=W_pred, b_pred=b_pred,
          mean_X=mean_X, std_X=std_X, mean_Y=mean_Y, std_Y=std_Y)
 
-print("模型已保存到 ./model/transformer_params_adamw.npz")
+print("模型已保存到 ./model/transformer_params.npz")
