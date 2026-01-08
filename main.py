@@ -211,3 +211,10 @@ gradients = {
     'W_pred': np.zeros_like(W_pred),
     'b_pred': np.zeros_like(b_pred)
 }
+
+# 计算梯度：偏 true_labels / 偏 predictions
+dL_dpred = []
+for y_pred,y_true in zip(predictions,true_labels):
+    # 2*(ŷ-y)/N
+    dL_dy_pred = (y_pred-y_true)
+    dL_dpred.append(dL_dy_pred)
