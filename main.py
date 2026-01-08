@@ -27,10 +27,13 @@ for i in range(len(norm_seq_X)-tau):
 # 超参数：批量 B
 B = 32
 
-# 分批
-batches = []  # (B,τ,4)
+# 准备样本和标签批次
+sample_batches = []  # (B,τ,4)
 for i in range(0,len(samples),B):
-    batches.append(samples[i:i+B])
+    sample_batches.append(samples[i:i+B])
+label_batches = []  # (B,)
+for i in range(0,len(labels),B):
+    label_batches.append(labels[i:i+B])
 
 # 超参数：嵌入维度 d_model
 d_model = 128
@@ -44,7 +47,7 @@ b_e = np.zeros(d_model)                                # (d_model,)
 
 # 线性投影
 E = []  # (B,τ,d_model)
-for _,X in enumerate(batches):
+for _,X in enumerate(sample_batches):
     E.append(X@W_e+b_e)
 
 # 位置编码
@@ -160,38 +163,25 @@ for batch in Z:
     res_2 = outs_LN_1+outs_FFN
     outs_LN_2 = LayerNorm(res_2,gamma,beta)
     outs_ENC.append(outs_LN_2)
-    
-# 转为 array（推荐）
-samples = np.array(samples)
-labels = np.array(labels)
 
-# 验证 d_model 可被 h 整除
-assert d_model % h == 0, "d_model must be divisible by h"
+# Xavier 初始化回归头权重和偏置
+W_pred = np.random.randn(d_model,1)*np.sqrt(1.0/d_model)
+b_pred = np.zeros(1)
 
-# 测试所有批次（包括最后一个不完整批次）
-for i, batch_X in enumerate(batches):
-    batch_X = np.array(batch_X)
-    B_i = batch_X.shape[0]
-    
-    # 前向传播
-    E_i = batch_X @ W_e + b_e
-    Z_i = E_i + P
-    out_enc = outs_ENC[i]  # 你的 outs_ENC[i] 应等于下面结果
-    
-    # 重新计算以验证
-    out_mha, _ = MHA(Z_i, W_Q, W_K, W_V, W_O)
-    out_l1 = LayerNorm(Z_i + out_mha, gamma, beta)
-    out_ffn = FFN(out_l1, W_1, b_1, W_2, b_2)
-    out_final = LayerNorm(out_l1 + out_ffn, gamma, beta)
-    
-    # 形状检查
-    assert out_final.shape == (B_i, tau, d_model)
-    
-    # 验证与 outs_ENC 一致（可选）
-    assert np.allclose(out_final, outs_ENC[i], atol=1e-6)
+# 预测值 (B,)
+predictions = []
+# 真实标签 (B,)
+true_labels = []
 
-# 验证注意力 softmax
-_, aw_list = MHA(Z[0], W_Q, W_K, W_V, W_O)
-assert np.allclose(aw_list[0][0].sum(axis=-1), 1.0, atol=1e-5)
-
-print("✅ 编码器前向传播验证通过！")
+# 回归预测头
+for i,out in enumerate(outs_ENC):
+    out = np.array(out)  # (B,τ,d_model)
+    label = np.array(label_batches[i])  # (B,)
+    # 取最后一步
+    repr = out[:,-1,:]  # (B,d_model)
+    # 应用回归头
+    y_pred = np.matmul(repr,W_pred)+b_pred  # (B_i, 1)
+    y_pred = y_pred.squeeze(-1)  # (B_i,)
+    # 储存
+    predictions.append(y_pred)
+    true_labels.append(label)
