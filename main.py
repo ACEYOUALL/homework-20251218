@@ -84,9 +84,10 @@ def ScaledDotProductAttention(Q_i, K_i, V_i):
     # 注意这里 Q_i、K_i、V_i 是单头，(B,τ,d_K)
     # 注意力得分：QK
     AS = np.matmul(Q_i,K_i.transpose(0,2,1))/np.sqrt(d_K)
-    # softmax 计算注意力权重，(B,τ,τ)
-    # 数值稳定形式？
-    AW = np.exp(AS)/np.sum(np.exp(AS),axis=-1,keepdims=True)
+    # softmax（数值稳定形式）计算注意力权重，(B,τ,τ)
+    AS = AS - np.max(AS,axis=-1,keepdims=True)
+    exp_AS = np.exp(AS)
+    AW = exp_AS/np.sum(exp_AS,axis=-1,keepdims=True)
     # 单头输出，(B,τ,d_V)
     out = np.matmul(AW,V_i)
     return out,AW
@@ -187,7 +188,7 @@ for i, batch_X in enumerate(batches):
     assert out_final.shape == (B_i, tau, d_model)
     
     # 验证与 outs_ENC 一致（可选）
-    # assert np.allclose(out_final, outs_ENC[i], atol=1e-6)
+    assert np.allclose(out_final, outs_ENC[i], atol=1e-6)
 
 # 验证注意力 softmax
 _, aw_list = MHA(Z[0], W_Q, W_K, W_V, W_O)
