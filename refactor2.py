@@ -24,7 +24,7 @@ norm_seq_X = (seq_X-mean_X)/(std_X+1e-8)
 norm_seq_Y = (seq_Y-mean_Y)/(std_Y+1e-8)
 
 # 超参数：滑动窗口长度 τ
-tau = 5
+tau = 10
 
 # 样本和标签
 samples = []  # (τ,4)
@@ -49,7 +49,7 @@ for i in range(0,len(labels),B):
 # ------------------------------------------------------------------
 
 # 超参数：嵌入维度 d_model
-d_model = 64
+d_model = 256
 
 # 超参数：输入维度 d_in
 d_in = 4
@@ -194,7 +194,7 @@ def FFN(Z, W_1, b_1, W_2, b_2):
 # ------------------------------------------------------------------
 
 # 超参数
-num_epochs = 30
+num_epochs = 100
 initial_lr = 0.001  # AdamW 通常用较小学习率
 final_lr = 1e-6     # 最终学习率
 weight_decay = 1e-2 # AdamW 的权重衰减
