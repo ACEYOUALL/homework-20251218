@@ -182,7 +182,7 @@ for i,out in enumerate(outs_ENC):
     # 应用回归头
     y_pred = np.matmul(repr,W_pred)+b_pred  # (B_i, 1)
     y_pred = y_pred.squeeze(-1)  # (B_i,)
-    # 储存
+    # 存储
     predictions.append(y_pred)
     true_labels.append(label)
     
@@ -212,9 +212,22 @@ gradients = {
     'b_pred': np.zeros_like(b_pred)
 }
 
-# 计算梯度：偏 true_labels / 偏 predictions
+# 计算梯度：∂L/∂ŷ
 dL_dpred = []
 for y_pred,y_true in zip(predictions,true_labels):
     # 2*(ŷ-y)/N
     dL_dy_pred = (y_pred-y_true)
     dL_dpred.append(dL_dy_pred)
+    
+# 反向传播：回归头
+dL_drepr_list = []
+for i,(y_pred,y_true, repr) in enumerate(zip(predictions,true_labels,[out[:,-1,:] for out in outs_ENC])):
+    dL_dy_pred = (y_pred-y_true)  # (B,)
+    # ∂L/∂W_pred
+    gradients['W_pred'] += np.matmul(repr.T,dL_dy_pred.reshape(-1,1))  # (d_model,1)
+    # ∂L/∂b_pred
+    gradients['b_pred'] += np.sum(dL_dy_pred,axis=0).reshape(1,)  # (1,)
+    # ∂L/∂repr
+    dL_drepr = np.matmul(dL_dy_pred.reshape(1, -1),W_pred.T).squeeze(0)  # (B,d_model)
+    # 存储
+    dL_drepr_list.append(dL_drepr)
