@@ -194,7 +194,20 @@ for y_pred,y_true in zip(predictions,true_labels):
     total_samples += len(y_true)
 mse_loss = total_loss/total_samples
 
-print(f"Initial MSE Loss: {mse_loss:.6f}")
-
-assert isinstance(mse_loss, float), "Loss should be a scalar"
-print("✅ Loss computed successfully.")
+# 初始化梯度字典
+gradients = {
+    'W_e': np.zeros_like(W_e),
+    'b_e': np.zeros_like(b_e),
+    'W_Q': np.zeros_like(W_Q),
+    'W_K': np.zeros_like(W_K),
+    'W_V': np.zeros_like(W_V),
+    'W_O': np.zeros_like(W_O),
+    'W_1': np.zeros_like(W_1),
+    'b_1': np.zeros_like(b_1),
+    'W_2': np.zeros_like(W_2),
+    'b_2': np.zeros_like(b_2),
+    'gamma': np.zeros_like(gamma),
+    'beta': np.zeros_like(beta),
+    'W_pred': np.zeros_like(W_pred),
+    'b_pred': np.zeros_like(b_pred)
+}
