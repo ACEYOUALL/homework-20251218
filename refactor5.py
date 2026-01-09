@@ -7,7 +7,7 @@ import os
 os.makedirs("./model", exist_ok=True)
 
 # ------------------------------------------------------------------
-# （1）数据预处理
+# （1）数据预处理（无修改）
 # ------------------------------------------------------------------
 
 # 读取原始数据（未归一化）
@@ -87,7 +87,7 @@ for i in range(0, len(val_labels), B):
         val_label_batches.append(batch)
 
 # ------------------------------------------------------------------
-# （2）模型参数初始化（【最终修复】修正Kaiming初始化fan_in）
+# （2）模型参数初始化（【核心修复】MHA Q/K初始化缩放+LeakyReLU）
 # ------------------------------------------------------------------
 
 d_model = 64
@@ -114,15 +114,15 @@ h = 8
 d_K = d_model // h  # 单头维度=8
 d_V = d_K
 
-# 【最终修复】修正Q/K/V/W_O的fan_in，确保初始化范围合理
-W_Q = KaimingInit((d_model, d_model), d_model)
-W_K = KaimingInit((d_model, d_model), d_model)
+# 【核心修复1】Q/K矩阵初始化缩小10倍，解决初始熵值异常
+W_Q = KaimingInit((d_model, d_model), d_model) * 0.1
+W_K = KaimingInit((d_model, d_model), d_model) * 0.1
 W_V = KaimingInit((d_model, d_model), d_model)
 W_O = KaimingInit((d_model, d_model), d_model)
 
 # 前馈维度
 d_ff = 4 * d_model
-# 【最终修复】修正FFN W_1的fan_in（d_model→d_model，避免初始化值过小）
+# 修正FFN W_1的fan_in（d_model→d_model，避免初始化值过小）
 W_1 = KaimingInit((d_model, d_ff), d_model)
 b_1 = np.zeros(d_ff)
 W_2 = KaimingInit((d_ff, d_model), d_ff)
@@ -139,7 +139,7 @@ W_pred = KaimingInit((d_model,1), d_model)
 b_pred = np.array([0.0])
 
 # ------------------------------------------------------------------
-# （3）辅助函数（【最终修复】核心：MHA和FFN梯度修复）
+# （3）辅助函数（【核心修复】LeakyReLU替换ReLU+梯度裁剪）
 # ------------------------------------------------------------------
 
 # 层归一化
@@ -173,17 +173,17 @@ def LayerNorm_with_grad(Z, gamma, beta, dL_dout=None):
     
     return out, (dL_dZ, dL_dgamma, dL_dbeta)
 
-# 【最终修复】缩放点积注意力（修正d_K缩放+数值稳定性）
+# 缩放点积注意力（修正d_K缩放+数值稳定性）
 def ScaledDotProductAttention(Q_i, K_i, V_i, d_K):
     # Q_i/K_i/V_i: (B, τ, d_K)
     B, T, _ = Q_i.shape
     
-    # 【最终修复1】确保注意力得分计算维度正确，缩放因子为sqrt(d_K)
+    # 确保注意力得分计算维度正确，缩放因子为sqrt(d_K)
     AS_original = np.matmul(Q_i, K_i.transpose(0,2,1))  # (B, τ, τ)
     scale = np.sqrt(d_K)
     AS_original = AS_original / (scale + 1e-8)  # 避免除零
     
-    # 【最终修复2】增强数值稳定性，防止exp溢出
+    # 增强数值稳定性，防止exp溢出
     max_AS = np.max(AS_original, axis=-1, keepdims=True)
     AS = AS_original - max_AS  # 平移到负数区间
     exp_AS = np.exp(AS)
@@ -196,7 +196,7 @@ def ScaledDotProductAttention(Q_i, K_i, V_i, d_K):
     # 返回所有中间变量用于反向传播
     return out, AW, AS_original, AS, max_AS, sum_exp_AS
 
-# 【最终修复】多头注意力实现（修正Q/K/V维度转换）
+# 多头注意力实现（修正Q/K/V维度转换）
 def MHA(Z, W_Q, W_K, W_V, W_O, h, d_K):
     B, tau, d_model = Z.shape
     
@@ -205,7 +205,7 @@ def MHA(Z, W_Q, W_K, W_V, W_O, h, d_K):
     K = np.matmul(Z, W_K)
     V = np.matmul(Z, W_V)
     
-    # 【最终修复3】修正Q/K/V的reshape和transpose维度（避免异常聚焦）
+    # 修正Q/K/V的reshape和transpose维度（避免异常聚焦）
     # 拆分到h个头：(B, τ, h, d_K) → (B, h, τ, d_K)
     Q_iso = Q.reshape(B, tau, h, d_K).transpose(0, 2, 1, 3)
     K_iso = K.reshape(B, tau, h, d_K).transpose(0, 2, 1, 3)
@@ -242,19 +242,36 @@ def MHA(Z, W_Q, W_K, W_V, W_O, h, d_K):
     return (outs_MHA, AWs, AS_originals, AS_list, max_AS_list, sum_exp_AS_list, 
             V_is, Q_iso, K_iso, V_iso, concat_out, Q, K, V)
 
-# ReLU激活函数（带梯度返回，便于验证）
-def ReLU(x):
-    return np.maximum(0, x)
+# 【核心修复2】LeakyReLU替换ReLU，避免梯度全0
+def LeakyReLU(x, alpha=0.1):
+    return np.where(x > 0, x, alpha * x)
 
-# 【最终修复】前馈网络实现（修正梯度计算逻辑）
+# 【核心修复3】梯度裁剪函数，避免梯度爆炸
+def clip_gradient(grads, max_norm=1.0):
+    clipped_grads = {}
+    total_norm = 0.0
+    for name, grad in grads.items():
+        norm = np.linalg.norm(grad)
+        total_norm += norm ** 2
+    total_norm = np.sqrt(total_norm)
+    
+    clip_coef = max_norm / (total_norm + 1e-8)
+    if clip_coef < 1.0:
+        for name, grad in grads.items():
+            clipped_grads[name] = grad * clip_coef
+    else:
+        clipped_grads = grads
+    return clipped_grads
+
+# 前馈网络实现（修正梯度计算逻辑）
 def FFN(Z, W_1, b_1, W_2, b_2):
     # Z: (B, τ, d_model)
     B, τ, d_model = Z.shape
     
     # 第一层线性变换：(B, τ, d_ff)
     L_1 = np.matmul(Z, W_1) + b_1
-    # ReLU激活
-    A = ReLU(L_1)
+    # LeakyReLU激活（替换ReLU）
+    A = LeakyReLU(L_1)
     # 第二层线性变换：(B, τ, d_model)
     L_2 = np.matmul(A, W_2) + b_2
     
@@ -311,7 +328,7 @@ class AdamWOptimizer:
         self.t = state_dict['t']
 
 # ------------------------------------------------------------------
-# （5）训练循环（【最终修复】核心：FFN梯度修复）
+# （5）训练循环（【核心修复】回归头改最后一步+梯度裁剪）
 # ------------------------------------------------------------------
 
 params = {
@@ -333,7 +350,7 @@ params = {
     'b_pred': b_pred
 }
 
-# 【最终修复4】调整学习率和权重衰减，减缓过拟合
+# 调整学习率和权重衰减，减缓过拟合
 optimizer = AdamWOptimizer(
     params,
     lr=3e-4,  # 降低学习率
@@ -351,6 +368,8 @@ best_val_loss = float('inf')
 
 # 用于验证注意力熵值的标记（仅打印一次）
 print_attention_entropy = True
+# 用于调试梯度的标记（仅第5轮第0批次打印）
+debug_grad = False
 
 for epoch in range(num_epochs):
     epoch_start_time = time.time()
@@ -399,7 +418,9 @@ for epoch in range(num_epochs):
         res_2 = outs_LN_1 + outs_FFN
         outs_LN_2 = LayerNorm(res_2, gamma2, beta2)
         
-        final_repr = np.mean(outs_LN_2, axis=1)
+        # 【核心修复4】回归头从全局池化改为取最后一步（单步预测核心修正）
+        # 原代码：final_repr = np.mean(outs_LN_2, axis=1)
+        final_repr = outs_LN_2[:, -1, :]  # 取最后一个时间步，维度(B, d_model)
         y_pred = (final_repr @ W_pred + b_pred).squeeze(-1)
         
         loss = np.mean((y_pred - y_true) ** 2)
@@ -407,17 +428,26 @@ for epoch in range(num_epochs):
         train_total_samples += B_actual
         
         # ------------------------------------------------------------------
-        # 反向传播（【最终修复】核心：FFN梯度修复）
+        # 反向传播（核心：FFN梯度修复 + 全链路调试打印）
         # ------------------------------------------------------------------
         grads = {name: np.zeros_like(param) for name, param in params.items()}
         
-        # 1. 回归头梯度
+        # 1. 回归头梯度（适配最后一步采样）
         dL_dy_pred = 2 * (y_pred - y_true) / B_actual
         grads['W_pred'] = final_repr.T @ dL_dy_pred.reshape(-1, 1)
         grads['b_pred'] = np.sum(dL_dy_pred).reshape(1,)
+        
+        # 【核心修复5】梯度传递适配最后一步采样（无稀释）
         dL_dfinal_repr = (dL_dy_pred.reshape(-1, 1) @ W_pred.T).reshape(B_actual, d_model)
-        dL_douts_LN2 = np.zeros_like(outs_LN_2)
-        dL_douts_LN2 += dL_dfinal_repr[:, np.newaxis, :] / tau
+        dL_douts_LN2 = np.zeros_like(outs_LN_2)  # (B, τ, d_model)
+        # 仅最后一步有梯度，无稀释
+        dL_douts_LN2[:, -1, :] = dL_dfinal_repr
+        
+        # 【调试打印1】LayerNorm2输入梯度
+        if debug_grad:
+            print(f"\n===== 梯度调试 - LayerNorm2环节 =====")
+            print(f"dL_douts_LN2 均值 = {np.mean(dL_douts_LN2):.8f}, 非零占比 = {np.mean((dL_douts_LN2 != 0).astype(float)):.4f}")
+            print(f"dL_douts_LN2 最大值 = {np.max(dL_douts_LN2):.8f}, 最小值 = {np.min(dL_douts_LN2):.8f}")
         
         # 2. LayerNorm2 反向
         _, (dL_dres2, dL_dgamma2, dL_dbeta2) = LayerNorm_with_grad(
@@ -426,9 +456,21 @@ for epoch in range(num_epochs):
         grads['gamma2'] = dL_dgamma2
         grads['beta2'] = dL_dbeta2
         
-        # 3. FFN + 第二残差梯度（【最终修复5】FFN梯度核心修复）
+        # 【调试打印2】LayerNorm2反向输出（残差梯度）
+        if debug_grad:
+            print(f"\n===== 梯度调试 - 残差梯度环节 =====")
+            print(f"dL_dres2 均值 = {np.mean(dL_dres2):.8f}, 非零占比 = {np.mean((dL_dres2 != 0).astype(float)):.4f}")
+            print(f"dL_dres2 最大值 = {np.max(dL_dres2):.8f}, 最小值 = {np.min(dL_dres2):.8f}")
+        
+        # 3. FFN + 第二残差梯度（FFN梯度核心修复）
         dL_douts_LN1 = dL_dres2.copy()  # 残差→LN1输出
         dL_douts_FFN = dL_dres2.copy()  # 残差→FFN输出
+        
+        # 【调试打印3】FFN第二层输入梯度
+        if debug_grad:
+            print(f"\n===== 梯度调试 - FFN第二层环节 =====")
+            print(f"dL_douts_FFN (dL_dL2) 均值 = {np.mean(dL_douts_FFN):.8f}, 非零占比 = {np.mean((dL_douts_FFN != 0).astype(float)):.4f}")
+            print(f"dL_douts_FFN 最大值 = {np.max(dL_douts_FFN):.8f}, 最小值 = {np.min(dL_douts_FFN):.8f}")
         
         # FFN第二层反向
         dL_dL2 = dL_douts_FFN  # (B, τ, d_model)
@@ -436,19 +478,45 @@ for epoch in range(num_epochs):
         grads['W_2'] = A.reshape(-1, d_ff).T @ dL_dL2.reshape(-1, d_model)
         grads['b_2'] = np.sum(dL_dL2, axis=(0,1))
         
-        # FFN激活层反向
+        # 【调试打印4】W_2梯度
+        if debug_grad:
+            print(f"W_2 梯度均值 = {np.mean(grads['W_2']):.8f}, 非零占比 = {np.mean((grads['W_2'] != 0).astype(float)):.4f}")
+        
+        # FFN激活层反向（适配LeakyReLU）
         dL_dA = dL_dL2 @ W_2.T  # (B, τ, d_ff)
         
-        # 【最终修复6】修正ReLU梯度计算（确保维度匹配+非全0）
-        dReLU_dL1 = (L_1 > 0).astype(np.float32)  # (B, τ, d_ff)
-        # 防止ReLU梯度全0，添加微小偏移
-        dReLU_dL1 = np.maximum(dReLU_dL1, 1e-6)
-        dL_dL1 = dL_dA * dReLU_dL1  # (B, τ, d_ff)
+        # 【调试打印5】激活层梯度
+        if debug_grad:
+            print(f"\n===== 梯度调试 - FFN激活层环节 =====")
+            print(f"dL_dA 均值 = {np.mean(dL_dA):.8f}, 非零占比 = {np.mean((dL_dA != 0).astype(float)):.4f}")
+            print(f"dL_dA 最大值 = {np.max(dL_dA):.8f}, 最小值 = {np.min(dL_dA):.8f}")
         
-        # 【最终修复7】修正FFN W_1梯度计算（核心！解决梯度为0问题）
+        # LeakyReLU梯度计算（替代ReLU）
+        alpha = 0.1
+        dLeakyReLU_dL1 = np.ones_like(L_1)
+        dLeakyReLU_dL1[L_1 <= 0] = alpha
+        
+        dL_dL1 = dL_dA * dLeakyReLU_dL1  # (B, τ, d_ff)
+        
+        # 【调试打印6】FFN第一层梯度
+        if debug_grad:
+            print(f"\n===== 梯度调试 - FFN第一层环节 =====")
+            print(f"dLeakyReLU_dL1 非零占比 = {np.mean((dLeakyReLU_dL1 != 0).astype(float)):.4f}")
+            print(f"dL_dL1 均值 = {np.mean(dL_dL1):.8f}, 非零占比 = {np.mean((dL_dL1 != 0).astype(float)):.4f}")
+            print(f"dL_dL1 最大值 = {np.max(dL_dL1):.8f}, 最小值 = {np.min(dL_dL1):.8f}")
+        
+        # 修正FFN W_1梯度计算（核心！解决梯度为0问题）
         # W_1: (d_model, d_ff) = (LN1输出)^T @ dL_dL1
         grads['W_1'] = outs_LN_1.reshape(-1, d_model).T @ dL_dL1.reshape(-1, d_ff)
         grads['b_1'] = np.sum(dL_dL1, axis=(0,1))
+        
+        # 【调试打印7】W_1梯度计算的输入矩阵
+        if debug_grad:
+            print(f"\n===== 梯度调试 - W_1梯度计算 =====")
+            print(f"outs_LN_1 形状 = {outs_LN_1.shape}, 均值 = {np.mean(outs_LN_1):.8f}")
+            print(f"dL_dL1 形状 = {dL_dL1.shape}, 均值 = {np.mean(dL_dL1):.8f}")
+            print(f"W_1 梯度形状 = {grads['W_1'].shape}, 均值 = {np.mean(grads['W_1']):.8f}")
+            print(f"W_1 梯度非零占比 = {np.mean((grads['W_1'] != 0).astype(float)):.4f}")
         
         # 合并FFN梯度到LN1输出
         dL_douts_LN1_from_FFN = dL_dL1 @ W_1.T  # (B, τ, d_model)
@@ -525,14 +593,23 @@ for epoch in range(num_epochs):
         grads['W_e'] = X_batch.reshape(-1, d_in).T @ dL_dE_batch.reshape(-1, d_model)
         grads['b_e'] = np.sum(dL_dE_batch, axis=(0,1))
         
+        # 【核心修复6】梯度裁剪，避免梯度爆炸
+        grads = clip_gradient(grads, max_norm=1.0)
+        
         # 验证梯度（第5轮打印）
         if epoch == 4 and batch_idx == 0:
-            print(f"\n第5轮嵌入层W_e梯度均值 = {np.mean(grads['W_e']):.6f}")
-            print(f"第5轮FFN W_1梯度均值 = {np.mean(grads['W_1']):.6f}（非0则修复成功）")
-            print(f"第5轮ReLU梯度非零占比 = {np.mean((dReLU_dL1 > 1e-6).astype(np.float32)):.4f}")
+            print(f"\n===== 第5轮梯度验证 =====")
+            print(f"嵌入层W_e梯度均值 = {np.mean(grads['W_e']):.6f}")
+            print(f"FFN W_1梯度均值 = {np.mean(grads['W_1']):.6f}（非0则修复成功）")
+            print(f"FFN W_2梯度均值 = {np.mean(grads['W_2']):.6f}")
+            print(f"LeakyReLU梯度非零占比 = {np.mean((dLeakyReLU_dL1 != 0).astype(np.float32)):.4f}")
+            # 开启调试模式，打印全链路梯度
+            debug_grad = True
         
         # 优化器更新
         optimizer.step(grads, lr=lr)
+        # 关闭调试模式（仅打印一次）
+        debug_grad = False
     
     # 验证阶段
     val_total_loss = 0.0
@@ -566,7 +643,8 @@ for epoch in range(num_epochs):
             res_2 = outs_LN_1 + outs_FFN
             outs_LN_2 = LayerNorm(res_2, gamma2, beta2)
             
-            final_repr = np.mean(outs_LN_2, axis=1)
+            # 验证阶段同样改为最后一步采样
+            final_repr = outs_LN_2[:, -1, :]
             y_pred = (final_repr @ W_pred + b_pred).squeeze(-1)
             
             loss = np.mean((y_pred - y_true) ** 2)
