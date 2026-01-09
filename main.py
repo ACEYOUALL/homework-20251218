@@ -12,7 +12,6 @@ os.makedirs("./model", exist_ok=True)
 
 seq = pd.read_csv("./data/training_set.csv", usecols=["AT", "EV", "AP", "RH", "PE"], encoding="utf-8").dropna().values
 
-
 # 分离标签
 seq_X = seq[:,:4]
 seq_Y = seq[:,4]
@@ -24,7 +23,7 @@ norm_seq_X = (seq_X - mean_X) / (std_X + 1e-8)
 norm_seq_Y = (seq_Y - mean_Y) / (std_Y + 1e-8)
 
 # 超参数：滑动窗口长度 τ
-tau = 8
+tau = 16
 
 # 样本和标签
 samples = []  # (τ,4)
@@ -33,23 +32,40 @@ for i in range(len(norm_seq_X)-tau):
     samples.append(norm_seq_X[i:i+tau,:])
     labels.append(norm_seq_Y[i+tau])
 
-# 超参数：批量 B
-B = 16
+# ✅ 新增：划分训练集和验证集（80%训练，20%验证，时序数据不随机划分）
+split_idx = int(len(samples) * 0.8)  # 按8:2划分
+train_samples = samples[:split_idx]
+train_labels = labels[:split_idx]
+val_samples = samples[split_idx:]
+val_labels = labels[split_idx:]
 
-# 准备样本和标签批次
-sample_batches = []  # (B,τ,4)
-for i in range(0,len(samples),B):
-    sample_batches.append(np.array(samples[i:i+B]))
-label_batches = []  # (B,)
-for i in range(0,len(labels),B):
-    label_batches.append(np.array(labels[i:i+B]))
+print(f"数据集划分完成 - 训练样本数: {len(train_samples)}, 验证样本数: {len(val_samples)}")  # ✅ 新增
+
+# 超参数：批量 B
+B = 32
+
+# ✅ 修改：生成训练集批次
+train_sample_batches = []  # (B,τ,4)
+for i in range(0, len(train_samples), B):
+    train_sample_batches.append(np.array(train_samples[i:i+B]))
+train_label_batches = []  # (B,)
+for i in range(0, len(train_labels), B):
+    train_label_batches.append(np.array(train_labels[i:i+B]))
+
+# ✅ 新增：生成验证集批次
+val_sample_batches = []  # (B,τ,4)
+for i in range(0, len(val_samples), B):
+    val_sample_batches.append(np.array(val_samples[i:i+B]))
+val_label_batches = []  # (B,)
+for i in range(0, len(val_labels), B):
+    val_label_batches.append(np.array(val_labels[i:i+B]))
 
 # ------------------------------------------------------------------
 # （2）模型参数初始化
 # ------------------------------------------------------------------
 
 # 超参数：模型维度
-d_model = 64
+d_model = 16
 
 # 超参数：输入维度
 d_in = 4
@@ -71,7 +87,7 @@ P[:,0::2] = np.sin(t*div_term)
 P[:,1::2] = np.cos(t*div_term)
 
 # 注意力头数
-h = 8
+h = 4
 
 # 单头维度
 d_K = d_model//h
@@ -84,7 +100,7 @@ W_V = KaimingInit((d_model, d_model), d_model)
 W_O = KaimingInit((d_model, d_model), d_model)
 
 # 前馈维度
-d_ff = 4 * d_model  # 4倍 d_model
+d_ff = 4 * d_model  # 8 倍 d_model
 
 # 初始化 FNN 两次线性投影的权重和偏置
 W_1 = KaimingInit((d_model, d_ff), d_model)
@@ -289,34 +305,35 @@ optimizer = AdamWOptimizer(
     lr=5e-4,  # 学习率
     betas=(0.9, 0.999),
     eps=1e-8,
-    weight_decay=1e-5 # AdamW 的权重衰减
+    weight_decay=1e-4 # AdamW 的权重衰减
 )
 
 # 训练超参数
-num_epochs = 300   # 训练轮数
+num_epochs = 100   # 训练轮数
 initial_lr = 5e-4  # 初始学习率
 final_lr = 1e-5    # 终末学习率
 
 print("开始训练...")
 
-# 记录最优学习率
-best_loss = float('inf')
+# ✅ 修改：最优损失改为验证集损失
+best_val_loss = float('inf')
 
 for epoch in range(num_epochs):
     # 记录训练信息
     epoch_start_time = time.time()
-    total_loss = 0.0
-    total_samples = 0
+    train_total_loss = 0.0  # ✅ 修改：区分训练损失
+    train_total_samples = 0
     
     # 以余弦退火调度学习率
     lr = final_lr + 0.5 * (initial_lr - final_lr) * (1 + np.cos(np.pi * epoch / num_epochs))
     
-    # 随机打乱批次
-    batch_indices = np.random.permutation(len(sample_batches))
+    # ---------------------- 训练阶段 ----------------------
+    # 随机打乱训练批次（验证集不打乱）
+    train_batch_indices = np.random.permutation(len(train_sample_batches))
     
-    for batch_idx in batch_indices:
-        X_batch = sample_batches[batch_idx]
-        y_true = label_batches[batch_idx]
+    for batch_idx in train_batch_indices:
+        X_batch = train_sample_batches[batch_idx]  # ✅ 修改：用训练集批次
+        y_true = train_label_batches[batch_idx]
         B_actual = X_batch.shape[0]
         
         # 从字典获取当前参数
@@ -356,8 +373,8 @@ for epoch in range(num_epochs):
         
         # 计算 MSE 损失
         loss = np.mean((y_pred - y_true) ** 2)
-        total_loss += loss * B_actual
-        total_samples += B_actual
+        train_total_loss += loss * B_actual
+        train_total_samples += B_actual
         
         # ------------------------------------------------------------------
         # 反向传播
@@ -472,21 +489,72 @@ for epoch in range(num_epochs):
         # ------------------------------------------------------------------
         optimizer.step(grads, lr=lr)
     
-    # 计算 MSE 损失
-    avg_loss = total_loss / total_samples
+    # ---------------------- 验证阶段 ----------------------
+    # ✅ 新增：验证集前向传播（无反向传播，无参数更新）
+    val_total_loss = 0.0
+    val_total_samples = 0
+    
+    # 验证阶段禁用梯度（这里通过不计算梯度实现）
+    with np.errstate(all='ignore'):  # 抑制数值警告
+        for batch_idx in range(len(val_sample_batches)):
+            X_batch = val_sample_batches[batch_idx]
+            y_true = val_label_batches[batch_idx]
+            B_actual = X_batch.shape[0]
+            
+            # 前向传播（仅计算损失，不反向传播）
+            W_e, b_e = params['W_e'], params['b_e']
+            W_Q, W_K, W_V, W_O = params['W_Q'], params['W_K'], params['W_V'], params['W_O']
+            W_1, b_1, W_2, b_2 = params['W_1'], params['b_1'], params['W_2'], params['b_2']
+            gamma1, beta1 = params['gamma1'], params['beta1']
+            gamma2, beta2 = params['gamma2'], params['beta2']
+            W_pred, b_pred = params['W_pred'], params['b_pred']
+            
+            E_batch = X_batch @ W_e + b_e
+            Z_batch = E_batch + P
+            
+            # 仅前向计算MHA（不需要中间变量）
+            outs_MHA, _, _, _, _, _, _, _, _, _, _, _, _, _ = MHA(
+                Z_batch, W_Q, W_K, W_V, W_O, h, d_K
+            )
+            
+            res_1 = Z_batch + outs_MHA
+            outs_LN_1 = LayerNorm(res_1, gamma1, beta1)
+            
+            outs_FFN, _, _ = FFN(outs_LN_1, W_1, b_1, W_2, b_2)
+            
+            res_2 = outs_LN_1 + outs_FFN
+            outs_LN_2 = LayerNorm(res_2, gamma2, beta2)
+            
+            final_repr = outs_LN_2[:, -1, :]
+            y_pred = (final_repr @ W_pred + b_pred).squeeze(-1)
+            
+            # 计算验证损失
+            loss = np.mean((y_pred - y_true) ** 2)
+            val_total_loss += loss * B_actual
+            val_total_samples += B_actual
+    
+    # ---------------------- 结果统计 ----------------------
+    # 计算训练和验证平均损失
+    avg_train_loss = train_total_loss / train_total_samples
+    avg_val_loss = val_total_loss / val_total_samples if val_total_samples > 0 else float('inf')
     epoch_time = time.time() - epoch_start_time
     
-    # 保存最优模型
-    if avg_loss < best_loss:
-        best_loss = avg_loss
+    # ✅ 修改：基于验证损失保存最优模型
+    if avg_val_loss < best_val_loss:
+        best_val_loss = avg_val_loss
         np.savez("./model/best_transformer_params.npz",
                  **params, mean_X=mean_X, std_X=std_X, mean_Y=mean_Y, std_Y=std_Y)
+        print(f"✅ 最优验证损失更新: {best_val_loss:.6f}，已保存模型")
     
-    # 打印训练信息
-    print(f"Epoch {epoch+1}/{num_epochs} - Loss: {avg_loss:.6f} - Best Loss: {best_loss:.6f} - LR: {lr:.6f} - Time: {epoch_time:.2f}s")
+    # 打印训练信息（包含训练/验证损失）
+    print(f"Epoch {epoch+1}/{num_epochs} - "
+          f"Train Loss: {avg_train_loss:.6f} - "
+          f"Val Loss: {avg_val_loss:.6f} - "
+          f"Best Val Loss: {best_val_loss:.6f} - "
+          f"LR: {lr:.6f} - Time: {epoch_time:.2f}s")
 
 print("训练完成！")
-print(f"最优损失: {best_loss:.6f}")
+print(f"最优验证损失: {best_val_loss:.6f}")
 
 # 保存最终模型
 np.savez("./model/transformer_params.npz",
