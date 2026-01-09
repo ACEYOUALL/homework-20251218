@@ -7,7 +7,7 @@ import os
 os.makedirs("./model", exist_ok=True)
 
 # ------------------------------------------------------------------
-# （1）数据预处理（核心修复：数据泄露问题）
+# （1）数据预处理
 # ------------------------------------------------------------------
 
 # 读取原始数据
@@ -34,7 +34,7 @@ train_labels = labels[:split_idx]
 val_samples = samples[split_idx:]
 val_labels = labels[split_idx:]
 
-# 【修改】仅基于训练集计算归一化统计量（解决数据泄露核心问题）
+# 仅基于训练集计算归一化统计量（解决数据泄露核心问题）
 train_samples_np = np.array(train_samples)  # (N_train, τ, 4)
 train_labels_np = np.array(train_labels)    # (N_train,)
 
@@ -45,7 +45,7 @@ std_X_train = train_samples_np.reshape(-1, 4).std(axis=0)    # (4,)
 mean_Y_train = train_labels_np.mean()
 std_Y_train = train_labels_np.std()
 
-# 【修改】用训练集统计量分别归一化训练集和验证集
+# 用训练集统计量分别归一化训练集和验证集
 # 训练集归一化
 norm_train_samples = (train_samples_np - mean_X_train) / (std_X_train + 1e-8)
 norm_train_labels = (train_labels_np - mean_Y_train) / (std_Y_train + 1e-8)
@@ -56,9 +56,13 @@ norm_val_samples = (val_samples_np - mean_X_train) / (std_X_train + 1e-8)
 norm_val_labels = (val_labels_np - mean_Y_train) / (std_Y_train + 1e-8)
 
 print(f"数据集划分完成 - 训练样本数: {len(norm_train_samples)}, 验证样本数: {len(norm_val_samples)}")
-# 【修改】打印归一化统计量（调试用）
-print(f"训练集特征均值: {mean_X_train}, 标准差: {std_X_train}")
-print(f"训练集标签均值: {mean_Y_train:.4f}, 标准差: {std_Y_train:.4f}")
+# 打印归一化统计量（调试用）
+print(f"【调试-归一化统计】训练集特征均值: {mean_X_train.round(4)}, 标准差: {std_X_train.round(4)}")
+print(f"【调试-归一化统计】训练集标签均值: {mean_Y_train:.4f}, 标准差: {std_Y_train:.4f}")
+# 【新增调试】打印归一化后的数据分布（确认归一化效果）
+print(f"【调试-归一化后分布】训练集特征均值: {norm_train_samples.mean():.6f}, 标准差: {norm_train_samples.std():.6f}")
+print(f"【调试-归一化后分布】验证集特征均值: {norm_val_samples.mean():.6f}, 标准差: {norm_val_samples.std():.6f}")
+print(f"【调试-归一化后分布】训练集标签均值: {norm_train_labels.mean():.6f}, 验证集标签均值: {norm_val_labels.mean():.6f}")
 
 # 超参数：批量大小 B
 B = 32
@@ -80,15 +84,15 @@ for i in range(0, len(norm_val_labels), B):
     val_label_batches.append(norm_val_labels[i:i+B])
 
 # ------------------------------------------------------------------
-# （2）模型参数初始化（修复：适配Swish的Kaiming初始化）
+# （2）模型参数初始化
 # ------------------------------------------------------------------
 
 # 超参数：模型维度
-d_model = 16
+d_model = 64
 # 超参数：输入维度
 d_in = 4
 
-# 【修改】调整Kaiming初始化增益，适配Swish激活（原ReLU增益不适用）
+# 调整Kaiming初始化增益，适配Swish激活（原ReLU增益不适用）
 def KaimingInit(shape, fan_in):
     # Swish激活的最优增益≈sqrt(1/fan_in)，替代原ReLU的sqrt(2/fan_in)
     return np.random.randn(*shape) * np.sqrt(1.0 / fan_in)
@@ -106,7 +110,7 @@ P[:,0::2] = np.sin(t*div_term)
 P[:,1::2] = np.cos(t*div_term)
 
 # 注意力头数
-h = 4
+h = 16
 # 单头维度
 d_K = d_model//h
 d_V = d_K
@@ -135,8 +139,13 @@ beta2 = np.zeros(d_model)
 W_pred = KaimingInit((d_model,1), d_model)
 b_pred = np.array([0.0])
 
+# 【新增调试】打印初始参数统计（确认初始化效果）
+print(f"\n【调试-初始参数】W_1均值: {W_1.mean():.6f}, 标准差: {W_1.std():.6f}")
+print(f"【调试-初始参数】W_2均值: {W_2.mean():.6f}, 标准差: {W_2.std():.6f}")
+print(f"【调试-初始参数】W_pred均值: {W_pred.mean():.6f}, 标准差: {W_pred.std():.6f}")
+
 # ------------------------------------------------------------------
-# （3）辅助函数（修复：LayerNorm改为预归一化逻辑）
+# （3）辅助函数
 # ------------------------------------------------------------------
 
 # 层归一化（核心函数保持不变）
@@ -283,7 +292,7 @@ class AdamWOptimizer:
         self.t = state_dict['t']
 
 # ------------------------------------------------------------------
-# （5）训练循环（核心修复：Pre-LN+平均池化+调整学习率）
+# （5）训练循环
 # ------------------------------------------------------------------
 
 # 参数字典
@@ -306,7 +315,7 @@ params = {
     'b_pred': b_pred
 }
 
-# 【修改】调整初始学习率（适配梯度幅值提升）
+# 调整初始学习率（适配梯度幅值提升）
 optimizer = AdamWOptimizer(
     params,
     lr=1e-3,  # 从5e-4提升到1e-3，让小梯度也能产生有效更新
@@ -317,11 +326,13 @@ optimizer = AdamWOptimizer(
 
 # 训练超参数
 num_epochs = 100   
-initial_lr = 1e-3  # 【修改】同步调整初始学习率
-final_lr = 1e-5    
+initial_lr = 1e-3  
+final_lr = 5e-4    
 
-print("开始训练...")
+print("\n开始训练...")
 best_val_loss = float('inf')
+# 【新增】标记是否打印过梯度（每个Epoch仅打印一次，避免刷屏）
+grad_print_flag = False
 
 for epoch in range(num_epochs):
     epoch_start_time = time.time()
@@ -348,12 +359,12 @@ for epoch in range(num_epochs):
         W_pred, b_pred = params['W_pred'], params['b_pred']
         
         # ------------------------------------------------------------------
-        # 前向传播（核心修改：Pre-LN预归一化 + 平均池化回归头）
+        # 前向传播
         # ------------------------------------------------------------------
         E_batch = X_batch @ W_e + b_e
         Z_batch = E_batch + P
         
-        # 【修改】Pre-LN：先归一化再做MHA（Transformer标准做法，稳定梯度）
+        # Pre-LN：先归一化再做MHA（Transformer标准做法，稳定梯度）
         LN_Z_batch = LayerNorm(Z_batch, gamma1, beta1)
         (outs_MHA, AWs, AS_originals, AS_list, max_AS_list, sum_exp_AS_list,
          V_is, Q_iso, K_iso, V_iso, concat_out, Q, K, V) = MHA(
@@ -362,13 +373,13 @@ for epoch in range(num_epochs):
         # 残差连接（Pre-LN：输入直接残差，而非归一化后）
         res_1 = Z_batch + outs_MHA
         
-        # 【修改】Pre-LN：FFN层先归一化再计算
+        # Pre-LN：FFN层先归一化再计算
         LN_res1 = LayerNorm(res_1, gamma2, beta2)
         outs_FFN, L_1, A = FFN(LN_res1, W_1, b_1, W_2, b_2)
         # 第二次残差连接
         res_2 = res_1 + outs_FFN
         
-        # 【修改】回归头：平均池化替代仅取最后时间步（解决梯度稀释）
+        # 回归头：平均池化替代仅取最后时间步（解决梯度稀释）
         final_repr = np.mean(res_2, axis=1)  # (B, d_model)，时序维度平均
         y_pred = (final_repr @ W_pred + b_pred).squeeze(-1)
         
@@ -378,7 +389,7 @@ for epoch in range(num_epochs):
         train_total_samples += B_actual
         
         # ------------------------------------------------------------------
-        # 反向传播（适配Pre-LN和平均池化的梯度计算）
+        # 反向传播
         # ------------------------------------------------------------------
         grads = {name: np.zeros_like(param) for name, param in params.items()}
         
@@ -386,7 +397,7 @@ for epoch in range(num_epochs):
         dL_dy_pred = 2 * (y_pred - y_true) / B_actual
         grads['W_pred'] = final_repr.T @ dL_dy_pred.reshape(-1, 1)
         grads['b_pred'] = np.sum(dL_dy_pred).reshape(1,)
-        # 【修改】平均池化的梯度：均匀分配到所有时间步
+        # 平均池化的梯度：均匀分配到所有时间步
         dL_dfinal_repr = (dL_dy_pred.reshape(-1, 1) @ W_pred.T).reshape(B_actual, d_model)
         dL_dres2 = np.tile(dL_dfinal_repr[:, np.newaxis, :], (1, tau, 1)) / tau  # (B, τ, d_model)
         
@@ -478,6 +489,19 @@ for epoch in range(num_epochs):
         # 优化器更新
         # ------------------------------------------------------------------
         optimizer.step(grads, lr=lr)
+        
+        # 【新增调试】每个Epoch仅打印一次梯度统计（避免刷屏）
+        if not grad_print_flag:
+            print(f"\n【调试-梯度幅值】Epoch {epoch+1} 第1个批次梯度统计：")
+            print(f"  W_1梯度均值: {grads['W_1'].mean():.8f}, 绝对值均值: {np.abs(grads['W_1']).mean():.8f}")
+            print(f"  W_2梯度均值: {grads['W_2'].mean():.8f}, 绝对值均值: {np.abs(grads['W_2']).mean():.8f}")
+            print(f"  W_pred梯度均值: {grads['W_pred'].mean():.8f}, 绝对值均值: {np.abs(grads['W_pred']).mean():.8f}")
+            print(f"  W_e梯度均值: {grads['W_e'].mean():.8f}, W_Q梯度均值: {grads['W_Q'].mean():.8f}")
+            # 打印中间变量分布（确认Pre-LN稳定性）
+            print(f"\n【调试-中间变量】LN_Z_batch均值: {LN_Z_batch.mean():.6f}, 标准差: {LN_Z_batch.std():.6f}")
+            print(f"【调试-中间变量】res_2均值: {res_2.mean():.6f}, 标准差: {res_2.std():.6f}")
+            print(f"【调试-中间变量】y_pred均值: {y_pred.mean():.6f}, y_true均值: {y_true.mean():.6f}")
+            grad_print_flag = True
     
     # 验证阶段
     val_total_loss = 0.0
@@ -525,10 +549,14 @@ for epoch in range(num_epochs):
     avg_val_loss = val_total_loss / val_total_samples if val_total_samples > 0 else float('inf')
     epoch_time = time.time() - epoch_start_time
     
+    # 【新增调试】每个Epoch打印参数更新后的统计
+    print(f"\n【调试-Epoch{epoch+1}参数】W_1均值: {params['W_1'].mean():.6f}, W_2均值: {params['W_2'].mean():.6f}")
+    print(f"【调试-Epoch{epoch+1}参数】W_pred均值: {params['W_pred'].mean():.6f}, b_pred: {params['b_pred'][0]:.6f}")
+    
     # 保存最优模型
     if avg_val_loss < best_val_loss:
         best_val_loss = avg_val_loss
-        # 【修改】保存时包含训练集的归一化统计量
+        # 保存时包含训练集的归一化统计量
         np.savez("./model/best_transformer_params.npz",
                  **params, 
                  mean_X_train=mean_X_train, std_X_train=std_X_train,
@@ -541,8 +569,11 @@ for epoch in range(num_epochs):
           f"Val Loss: {avg_val_loss:.6f} - "
           f"Best Val Loss: {best_val_loss:.6f} - "
           f"LR: {lr:.6f} - Time: {epoch_time:.2f}s")
+    
+    # 重置梯度打印标记（下一个Epoch重新打印）
+    grad_print_flag = False
 
-print("训练完成！")
+print("\n训练完成！")
 print(f"最优验证损失: {best_val_loss:.6f}")
 
 # 保存最终模型（包含训练集统计量）
