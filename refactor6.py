@@ -56,13 +56,6 @@ norm_val_samples = (val_samples_np - mean_X_train) / (std_X_train + 1e-8)
 norm_val_labels = (val_labels_np - mean_Y_train) / (std_Y_train + 1e-8)
 
 print(f"数据集划分完成 - 训练样本数: {len(norm_train_samples)}, 验证样本数: {len(norm_val_samples)}")
-# 打印归一化统计量（调试用）
-print(f"【调试-归一化统计】训练集特征均值: {mean_X_train.round(4)}, 标准差: {std_X_train.round(4)}")
-print(f"【调试-归一化统计】训练集标签均值: {mean_Y_train:.4f}, 标准差: {std_Y_train:.4f}")
-# 【新增调试】打印归一化后的数据分布（确认归一化效果）
-print(f"【调试-归一化后分布】训练集特征均值: {norm_train_samples.mean():.6f}, 标准差: {norm_train_samples.std():.6f}")
-print(f"【调试-归一化后分布】验证集特征均值: {norm_val_samples.mean():.6f}, 标准差: {norm_val_samples.std():.6f}")
-print(f"【调试-归一化后分布】训练集标签均值: {norm_train_labels.mean():.6f}, 验证集标签均值: {norm_val_labels.mean():.6f}")
 
 # 超参数：批量大小 B
 B = 32
@@ -84,13 +77,15 @@ for i in range(0, len(norm_val_labels), B):
     val_label_batches.append(norm_val_labels[i:i+B])
 
 # ------------------------------------------------------------------
-# （2）模型参数初始化
+# （2）模型参数初始化 - 三层架构（扁平化参数字典）
 # ------------------------------------------------------------------
 
 # 超参数：模型维度
 d_model = 64
 # 超参数：输入维度
 d_in = 4
+# 新增：编码器层数
+num_layers = 3
 
 # 调整Kaiming初始化增益，适配Swish激活（原ReLU增益不适用）
 def KaimingInit(shape, fan_in):
@@ -115,37 +110,39 @@ h = 16
 d_K = d_model//h
 d_V = d_K
 
-# 初始化注意力层参数
-W_Q = KaimingInit((d_model, d_model), d_model)
-W_K = KaimingInit((d_model, d_model), d_model)
-W_V = KaimingInit((d_model, d_model), d_model)
-W_O = KaimingInit((d_model, d_model), d_model)
-
 # 前馈网络维度
 d_ff = 4 * d_model
-# 初始化FNN参数
-W_1 = KaimingInit((d_model, d_ff), d_model)
-b_1 = np.zeros(d_ff)
-W_2 = KaimingInit((d_ff, d_model), d_ff)
-b_2 = np.zeros(d_model)
 
-# LayerNorm参数
-gamma1 = np.ones(d_model)
-beta1 = np.zeros(d_model)
-gamma2 = np.ones(d_model)
-beta2 = np.zeros(d_model)
+# 【关键修改】为每层初始化独立参数（扁平化字典结构）
+params = {
+    'W_e': W_e,
+    'b_e': b_e,
+    'W_pred': KaimingInit((d_model,1), d_model),
+    'b_pred': np.array([0.0])
+}
 
-# 回归头参数
-W_pred = KaimingInit((d_model,1), d_model)
-b_pred = np.array([0.0])
-
-# 【新增调试】打印初始参数统计（确认初始化效果）
-print(f"\n【调试-初始参数】W_1均值: {W_1.mean():.6f}, 标准差: {W_1.std():.6f}")
-print(f"【调试-初始参数】W_2均值: {W_2.mean():.6f}, 标准差: {W_2.std():.6f}")
-print(f"【调试-初始参数】W_pred均值: {W_pred.mean():.6f}, 标准差: {W_pred.std():.6f}")
+# 为每层创建参数
+for layer_idx in range(num_layers):
+    # MHA参数
+    params[f'layer{layer_idx}_W_Q'] = KaimingInit((d_model, d_model), d_model)
+    params[f'layer{layer_idx}_W_K'] = KaimingInit((d_model, d_model), d_model)
+    params[f'layer{layer_idx}_W_V'] = KaimingInit((d_model, d_model), d_model)
+    params[f'layer{layer_idx}_W_O'] = KaimingInit((d_model, d_model), d_model)
+    
+    # FFN参数
+    params[f'layer{layer_idx}_W_1'] = KaimingInit((d_model, d_ff), d_model)
+    params[f'layer{layer_idx}_b_1'] = np.zeros(d_ff)
+    params[f'layer{layer_idx}_W_2'] = KaimingInit((d_ff, d_model), d_ff)
+    params[f'layer{layer_idx}_b_2'] = np.zeros(d_model)
+    
+    # LayerNorm参数
+    params[f'layer{layer_idx}_gamma1'] = np.ones(d_model)
+    params[f'layer{layer_idx}_beta1'] = np.zeros(d_model)
+    params[f'layer{layer_idx}_gamma2'] = np.ones(d_model)
+    params[f'layer{layer_idx}_beta2'] = np.zeros(d_model)
 
 # ------------------------------------------------------------------
-# （3）辅助函数
+# （3）辅助函数（保持不变）
 # ------------------------------------------------------------------
 
 # 层归一化（核心函数保持不变）
@@ -254,7 +251,8 @@ class AdamWOptimizer:
         self.v = {name: np.zeros_like(param) for name, param in params.items()}
         self.t = 0
         
-        self.weight_params = ['W_e', 'W_Q', 'W_K', 'W_V', 'W_O', 'W_1', 'W_2', 'W_pred']
+        # 自动识别权重参数（包含'W_'的参数）
+        self.weight_params = [name for name in params.keys() if 'W_' in name or 'W_e' in name or 'W_pred' in name]
     
     def step(self, grads, lr=None):
         self.t += 1
@@ -292,30 +290,10 @@ class AdamWOptimizer:
         self.t = state_dict['t']
 
 # ------------------------------------------------------------------
-# （5）训练循环
+# （5）训练循环 - 三层架构
 # ------------------------------------------------------------------
 
-# 参数字典
-params = {
-    'W_e': W_e,
-    'b_e': b_e,
-    'W_Q': W_Q,
-    'W_K': W_K,
-    'W_V': W_V,
-    'W_O': W_O,
-    'W_1': W_1,
-    'b_1': b_1,
-    'W_2': W_2,
-    'b_2': b_2,
-    'gamma1': gamma1,
-    'beta1': beta1,
-    'gamma2': gamma2,
-    'beta2': beta2,
-    'W_pred': W_pred,
-    'b_pred': b_pred
-}
-
-# 调整初始学习率（适配梯度幅值提升）
+# 优化器
 optimizer = AdamWOptimizer(
     params,
     lr=1e-3,  # 从5e-4提升到1e-3，让小梯度也能产生有效更新
@@ -329,10 +307,9 @@ num_epochs = 100
 initial_lr = 1e-3  
 final_lr = 5e-4    
 
-print("\n开始训练...")
+print("\n开始训练 (三层Transformer)...")
 best_val_loss = float('inf')
-# 【新增】标记是否打印过梯度（每个Epoch仅打印一次，避免刷屏）
-grad_print_flag = False
+grad_print_flag = False  # 每个epoch仅打印一次梯度
 
 for epoch in range(num_epochs):
     epoch_start_time = time.time()
@@ -350,38 +327,82 @@ for epoch in range(num_epochs):
         y_true = train_label_batches[batch_idx]
         B_actual = X_batch.shape[0]
         
-        # 从字典获取当前参数
-        W_e, b_e = params['W_e'], params['b_e']
-        W_Q, W_K, W_V, W_O = params['W_Q'], params['W_K'], params['W_V'], params['W_O']
-        W_1, b_1, W_2, b_2 = params['W_1'], params['b_1'], params['W_2'], params['b_2']
-        gamma1, beta1 = params['gamma1'], params['beta1']
-        gamma2, beta2 = params['gamma2'], params['beta2']
-        W_pred, b_pred = params['W_pred'], params['b_pred']
-        
         # ------------------------------------------------------------------
-        # 前向传播
+        # 前向传播 (三层)
         # ------------------------------------------------------------------
-        E_batch = X_batch @ W_e + b_e
-        Z_batch = E_batch + P
+        # 1. 嵌入层
+        E_batch = X_batch @ params['W_e'] + params['b_e']  # (B, τ, d_model)
+        Z_batch = E_batch + P  # 添加位置编码
         
-        # Pre-LN：先归一化再做MHA（Transformer标准做法，稳定梯度）
-        LN_Z_batch = LayerNorm(Z_batch, gamma1, beta1)
-        (outs_MHA, AWs, AS_originals, AS_list, max_AS_list, sum_exp_AS_list,
-         V_is, Q_iso, K_iso, V_iso, concat_out, Q, K, V) = MHA(
-            LN_Z_batch, W_Q, W_K, W_V, W_O, h, d_K
-        )
-        # 残差连接（Pre-LN：输入直接残差，而非归一化后）
-        res_1 = Z_batch + outs_MHA
+        # 保存每层的中间变量
+        layer_caches = []
         
-        # Pre-LN：FFN层先归一化再计算
-        LN_res1 = LayerNorm(res_1, gamma2, beta2)
-        outs_FFN, L_1, A = FFN(LN_res1, W_1, b_1, W_2, b_2)
-        # 第二次残差连接
-        res_2 = res_1 + outs_FFN
+        # 2. 通过三层编码器
+        for layer_idx in range(num_layers):
+            # 获取当前层参数
+            W_Q = params[f'layer{layer_idx}_W_Q']
+            W_K = params[f'layer{layer_idx}_W_K']
+            W_V = params[f'layer{layer_idx}_W_V']
+            W_O = params[f'layer{layer_idx}_W_O']
+            W_1 = params[f'layer{layer_idx}_W_1']
+            b_1 = params[f'layer{layer_idx}_b_1']
+            W_2 = params[f'layer{layer_idx}_W_2']
+            b_2 = params[f'layer{layer_idx}_b_2']
+            gamma1 = params[f'layer{layer_idx}_gamma1']
+            beta1 = params[f'layer{layer_idx}_beta1']
+            gamma2 = params[f'layer{layer_idx}_gamma2']
+            beta2 = params[f'layer{layer_idx}_beta2']
+            
+            # Pre-LN 1: MHA前的LayerNorm
+            LN_Z, cache_LN1 = LayerNorm_with_grad(Z_batch, gamma1, beta1)
+            
+            # MHA
+            (outs_MHA, AWs, AS_originals, AS_list, max_AS_list, sum_exp_AS_list,
+             V_is, Q_iso, K_iso, V_iso, concat_out, Q, K, V) = MHA(
+                LN_Z, W_Q, W_K, W_V, W_O, h, d_K
+            )
+            
+            # 残差连接1: 输入 + MHA输出
+            res1 = Z_batch + outs_MHA
+            
+            # Pre-LN 2: FFN前的LayerNorm
+            LN_res1, cache_LN2 = LayerNorm_with_grad(res1, gamma2, beta2)
+            
+            # FFN
+            outs_FFN, L_1, A = FFN(LN_res1, W_1, b_1, W_2, b_2)
+            
+            # 残差连接2: res1 + FFN输出
+            Z_batch = res1 + outs_FFN
+            
+            # 保存中间变量用于反向传播
+            layer_caches.append({
+                'LN_Z': LN_Z,
+                'cache_LN1': cache_LN1,
+                'outs_MHA': outs_MHA,
+                'AWs': AWs,
+                'AS_originals': AS_originals,
+                'max_AS_list': max_AS_list,
+                'sum_exp_AS_list': sum_exp_AS_list,
+                'V_is': V_is,
+                'Q_iso': Q_iso,
+                'K_iso': K_iso,
+                'V_iso': V_iso,
+                'concat_out': concat_out,
+                'Q': Q,
+                'K': K,
+                'V': V,
+                'res1': res1,
+                'LN_res1': LN_res1,
+                'cache_LN2': cache_LN2,
+                'outs_FFN': outs_FFN,
+                'L_1': L_1,
+                'A': A,
+                'input': Z_batch.copy()  # 保存输入用于梯度检查
+            })
         
-        # 回归头：平均池化替代仅取最后时间步（解决梯度稀释）
-        final_repr = np.mean(res_2, axis=1)  # (B, d_model)，时序维度平均
-        y_pred = (final_repr @ W_pred + b_pred).squeeze(-1)
+        # 3. 回归头
+        final_repr = np.mean(Z_batch, axis=1)  # (B, d_model)
+        y_pred = (final_repr @ params['W_pred'] + params['b_pred']).squeeze(-1)  # (B,)
         
         # 计算MSE损失
         loss = np.mean((y_pred - y_true) ** 2)
@@ -389,118 +410,147 @@ for epoch in range(num_epochs):
         train_total_samples += B_actual
         
         # ------------------------------------------------------------------
-        # 反向传播
+        # 反向传播 (三层)
         # ------------------------------------------------------------------
         grads = {name: np.zeros_like(param) for name, param in params.items()}
         
-        # 1. 回归头梯度（适配平均池化）
+        # 1. 回归头梯度
         dL_dy_pred = 2 * (y_pred - y_true) / B_actual
         grads['W_pred'] = final_repr.T @ dL_dy_pred.reshape(-1, 1)
         grads['b_pred'] = np.sum(dL_dy_pred).reshape(1,)
-        # 平均池化的梯度：均匀分配到所有时间步
-        dL_dfinal_repr = (dL_dy_pred.reshape(-1, 1) @ W_pred.T).reshape(B_actual, d_model)
-        dL_dres2 = np.tile(dL_dfinal_repr[:, np.newaxis, :], (1, tau, 1)) / tau  # (B, τ, d_model)
         
-        # 2. 第二次残差连接 + FFN反向传播（适配Pre-LN）
-        dL_dres1 = dL_dres2.copy()
-        dL_douts_FFN = dL_dres2.copy()
+        # 平均池化梯度
+        dL_dfinal_repr = (dL_dy_pred.reshape(-1, 1) @ params['W_pred'].T).reshape(B_actual, d_model)
+        dL_dlast_layer = np.tile(dL_dfinal_repr[:, np.newaxis, :], (1, tau, 1)) / tau  # (B, τ, d_model)
         
-        # FFN反向
-        dL_dL2 = dL_douts_FFN
-        grads['W_2'] = A.reshape(-1, d_ff).T @ dL_dL2.reshape(-1, d_model)
-        grads['b_2'] = np.sum(dL_dL2, axis=(0,1))
-        dL_dA = dL_dL2.reshape(-1, d_model) @ W_2.T
-        dL_dA = dL_dA.reshape(B_actual, tau, d_ff)
-        
-        # Swish梯度
-        sigmoid_L1 = 1.0 / (1.0 + np.exp(-L_1))
-        dSwish_dL1 = sigmoid_L1 * (1 + L_1 * (1 - sigmoid_L1))
-        dL_dL1 = dL_dA * dSwish_dL1
-        
-        # FFN第一层梯度
-        grads['W_1'] = LN_res1.reshape(-1, d_model).T @ dL_dL1.reshape(-1, d_ff)
-        grads['b_1'] = np.sum(dL_dL1, axis=(0,1))
-        
-        # Pre-LN：LN_res1的梯度
-        _, (dL_dres1_from_FFN, dL_dgamma2, dL_dbeta2) = LayerNorm_with_grad(
-            res_1, gamma2, beta2, dL_dL1 @ W_1.T
-        )
-        grads['gamma2'] = dL_dgamma2
-        grads['beta2'] = dL_dbeta2
-        dL_dres1 += dL_dres1_from_FFN
-        
-        # 3. 第一次残差连接 + MHA反向传播（适配Pre-LN）
-        dL_dZ_batch = dL_dres1.copy()
-        dL_douts_MHA = dL_dres1.copy()
-        
-        # MHA反向
-        grads['W_O'] = concat_out.reshape(-1, d_model).T @ dL_douts_MHA.reshape(-1, d_model)
-        dL_dconcat_out = dL_douts_MHA.reshape(-1, d_model) @ W_O.T
-        dL_dconcat_out = dL_dconcat_out.reshape(B_actual, tau, d_model)
-        
-        dL_dQ_total = np.zeros((B_actual, tau, d_model))
-        dL_dK_total = np.zeros((B_actual, tau, d_model))
-        dL_dV_total = np.zeros((B_actual, tau, d_model))
-        
-        for i in range(h):
-            dL_dout_i = dL_dconcat_out[:, :, i*d_K:(i+1)*d_K]
-            AW_i = AWs[i]
-            V_i = V_is[i]
-            Q_i = Q_iso[:, i, :, :]
-            K_i = K_iso[:, i, :, :]
-            AS_original_i = AS_originals[i]
-            AS_i = AS_list[i]
-            max_AS_i = max_AS_list[i]
-            sum_exp_AS_i = sum_exp_AS_list[i]
+        # 2. 反向传播通过各层
+        dL_dZ = dL_dlast_layer
+        for layer_idx in reversed(range(num_layers)):
+            cache = layer_caches[layer_idx]
             
-            dL_dV_i = np.matmul(AW_i.transpose(0,2,1), dL_dout_i)
-            dL_dAW = np.matmul(dL_dout_i, V_i.transpose(0,2,1))
-            dL_dAS = AW_i * (dL_dAW - np.sum(dL_dAW * AW_i, axis=-1, keepdims=True))
-            dL_dmax_AS = np.sum(dL_dAS, axis=-1, keepdims=True)
-            mask = (AS_original_i == max_AS_i).astype(np.float32)
-            mask_sum = np.sum(mask, axis=-1, keepdims=True) + 1e-8
-            dL_dAS_original = dL_dAS - mask * dL_dmax_AS / mask_sum
+            # 获取当前层参数
+            W_Q = params[f'layer{layer_idx}_W_Q']
+            W_K = params[f'layer{layer_idx}_W_K']
+            W_V = params[f'layer{layer_idx}_W_V']
+            W_O = params[f'layer{layer_idx}_W_O']
+            W_1 = params[f'layer{layer_idx}_W_1']
+            W_2 = params[f'layer{layer_idx}_W_2']
+            b_1 = params[f'layer{layer_idx}_b_1']
+            b_2 = params[f'layer{layer_idx}_b_2']
+            gamma1 = params[f'layer{layer_idx}_gamma1']
+            beta1 = params[f'layer{layer_idx}_beta1']
+            gamma2 = params[f'layer{layer_idx}_gamma2']
+            beta2 = params[f'layer{layer_idx}_beta2']
             
-            dL_dQ_i = np.matmul(dL_dAS_original / np.sqrt(d_K), K_i)
-            dL_dK_i = np.matmul(dL_dAS_original.transpose(0,2,1) / np.sqrt(d_K), Q_i)
+            # 残差连接2的梯度
+            dL_dres1 = dL_dZ.copy()
+            dL_douts_FFN = dL_dZ.copy()
             
-            dL_dQ_total[:, :, i*d_K:(i+1)*d_K] += dL_dQ_i
-            dL_dK_total[:, :, i*d_K:(i+1)*d_K] += dL_dK_i
-            dL_dV_total[:, :, i*d_K:(i+1)*d_K] += dL_dV_i
+            # FFN反向
+            dL_dL2 = dL_douts_FFN
+            grads[f'layer{layer_idx}_W_2'] = cache['A'].reshape(-1, d_ff).T @ dL_dL2.reshape(-1, d_model)
+            grads[f'layer{layer_idx}_b_2'] = np.sum(dL_dL2, axis=(0,1))
+            dL_dA = dL_dL2.reshape(-1, d_model) @ W_2.T
+            dL_dA = dL_dA.reshape(B_actual, tau, d_ff)
+            
+            # Swish梯度
+            sigmoid_L1 = 1.0 / (1.0 + np.exp(-cache['L_1']))
+            dSwish_dL1 = sigmoid_L1 * (1 + cache['L_1'] * (1 - sigmoid_L1))
+            dL_dL1 = dL_dA * dSwish_dL1
+            
+            # FFN第一层梯度
+            grads[f'layer{layer_idx}_W_1'] = cache['LN_res1'].reshape(-1, d_model).T @ dL_dL1.reshape(-1, d_ff)
+            grads[f'layer{layer_idx}_b_1'] = np.sum(dL_dL1, axis=(0,1))
+            
+            # Pre-LN2 (FFN前)的梯度
+            _, (dL_dres1_from_FFN, dL_dgamma2, dL_dbeta2) = LayerNorm_with_grad(
+                cache['res1'], gamma2, beta2, dL_dL1 @ W_1.T
+            )
+            grads[f'layer{layer_idx}_gamma2'] = dL_dgamma2
+            grads[f'layer{layer_idx}_beta2'] = dL_dbeta2
+            dL_dres1 += dL_dres1_from_FFN
+            
+            # 残差连接1的梯度
+            dL_dinput = dL_dres1.copy()
+            dL_douts_MHA = dL_dres1.copy()
+            
+            # MHA反向
+            grads[f'layer{layer_idx}_W_O'] = cache['concat_out'].reshape(-1, d_model).T @ dL_douts_MHA.reshape(-1, d_model)
+            dL_dconcat_out = dL_douts_MHA.reshape(-1, d_model) @ W_O.T
+            dL_dconcat_out = dL_dconcat_out.reshape(B_actual, tau, d_model)
+            
+            dL_dQ_total = np.zeros((B_actual, tau, d_model))
+            dL_dK_total = np.zeros((B_actual, tau, d_model))
+            dL_dV_total = np.zeros((B_actual, tau, d_model))
+            
+            for i in range(h):
+                dL_dout_i = dL_dconcat_out[:, :, i*d_K:(i+1)*d_K]
+                AW_i = cache['AWs'][i]
+                V_i = cache['V_is'][i]
+                Q_i = cache['Q_iso'][:, i, :, :]
+                K_i = cache['K_iso'][:, i, :, :]
+                AS_original_i = cache['AS_originals'][i]
+                max_AS_i = cache['max_AS_list'][i]
+                sum_exp_AS_i = cache['sum_exp_AS_list'][i]
+                
+                dL_dV_i = np.matmul(AW_i.transpose(0,2,1), dL_dout_i)
+                dL_dAW = np.matmul(dL_dout_i, V_i.transpose(0,2,1))
+                dL_dAS = AW_i * (dL_dAW - np.sum(dL_dAW * AW_i, axis=-1, keepdims=True))
+                dL_dmax_AS = np.sum(dL_dAS, axis=-1, keepdims=True)
+                mask = (AS_original_i == max_AS_i).astype(np.float32)
+                mask_sum = np.sum(mask, axis=-1, keepdims=True) + 1e-8
+                dL_dAS_original = dL_dAS - mask * dL_dmax_AS / mask_sum
+                
+                dL_dQ_i = np.matmul(dL_dAS_original / np.sqrt(d_K), K_i)
+                dL_dK_i = np.matmul(dL_dAS_original.transpose(0,2,1) / np.sqrt(d_K), Q_i)
+                
+                dL_dQ_total[:, :, i*d_K:(i+1)*d_K] += dL_dQ_i
+                dL_dK_total[:, :, i*d_K:(i+1)*d_K] += dL_dK_i
+                dL_dV_total[:, :, i*d_K:(i+1)*d_K] += dL_dV_i
+            
+            # Q/K/V投影梯度
+            grads[f'layer{layer_idx}_W_Q'] = cache['LN_Z'].reshape(-1, d_model).T @ dL_dQ_total.reshape(-1, d_model)
+            grads[f'layer{layer_idx}_W_K'] = cache['LN_Z'].reshape(-1, d_model).T @ dL_dK_total.reshape(-1, d_model)
+            grads[f'layer{layer_idx}_W_V'] = cache['LN_Z'].reshape(-1, d_model).T @ dL_dV_total.reshape(-1, d_model)
+            
+            # Pre-LN1 (MHA前)的梯度
+            _, (dL_dinput_from_MHA, dL_dgamma1, dL_dbeta1) = LayerNorm_with_grad(
+                cache['input'], gamma1, beta1, 
+                dL_dQ_total @ W_Q.T + dL_dK_total @ W_K.T + dL_dV_total @ W_V.T
+            )
+            grads[f'layer{layer_idx}_gamma1'] = dL_dgamma1
+            grads[f'layer{layer_idx}_beta1'] = dL_dbeta1
+            dL_dinput += dL_dinput_from_MHA
+            
+            # 传递到前一层
+            dL_dZ = dL_dinput
         
-        # Q/K/V投影梯度
-        grads['W_Q'] = LN_Z_batch.reshape(-1, d_model).T @ dL_dQ_total.reshape(-1, d_model)
-        grads['W_K'] = LN_Z_batch.reshape(-1, d_model).T @ dL_dK_total.reshape(-1, d_model)
-        grads['W_V'] = LN_Z_batch.reshape(-1, d_model).T @ dL_dV_total.reshape(-1, d_model)
-        
-        # Pre-LN：LN_Z_batch的梯度
-        _, (dL_dZ_batch_from_MHA, dL_dgamma1, dL_dbeta1) = LayerNorm_with_grad(
-            Z_batch, gamma1, beta1, dL_dQ_total @ W_Q.T + dL_dK_total @ W_K.T + dL_dV_total @ W_V.T
-        )
-        grads['gamma1'] = dL_dgamma1
-        grads['beta1'] = dL_dbeta1
-        dL_dZ_batch += dL_dZ_batch_from_MHA
-        
-        # 4. Embedding层梯度
-        grads['W_e'] = X_batch.reshape(-1, d_in).T @ dL_dZ_batch.reshape(-1, d_model)
-        grads['b_e'] = np.sum(dL_dZ_batch, axis=(0,1))
+        # 3. 嵌入层梯度
+        grads['W_e'] = X_batch.reshape(-1, d_in).T @ dL_dZ.reshape(-1, d_model)
+        grads['b_e'] = np.sum(dL_dZ, axis=(0,1))
         
         # ------------------------------------------------------------------
         # 优化器更新
         # ------------------------------------------------------------------
         optimizer.step(grads, lr=lr)
         
-        # 【新增调试】每个Epoch仅打印一次梯度统计（避免刷屏）
+        # 梯度调试（每epoch第一次）
         if not grad_print_flag:
             print(f"\n【调试-梯度幅值】Epoch {epoch+1} 第1个批次梯度统计：")
-            print(f"  W_1梯度均值: {grads['W_1'].mean():.8f}, 绝对值均值: {np.abs(grads['W_1']).mean():.8f}")
-            print(f"  W_2梯度均值: {grads['W_2'].mean():.8f}, 绝对值均值: {np.abs(grads['W_2']).mean():.8f}")
+            print(f"  layer0_W_1梯度均值: {grads['layer0_W_1'].mean():.8f}, 绝对值均值: {np.abs(grads['layer0_W_1']).mean():.8f}")
+            print(f"  layer2_W_2梯度均值: {grads['layer2_W_2'].mean():.8f}, 绝对值均值: {np.abs(grads['layer2_W_2']).mean():.8f}")
             print(f"  W_pred梯度均值: {grads['W_pred'].mean():.8f}, 绝对值均值: {np.abs(grads['W_pred']).mean():.8f}")
-            print(f"  W_e梯度均值: {grads['W_e'].mean():.8f}, W_Q梯度均值: {grads['W_Q'].mean():.8f}")
-            # 打印中间变量分布（确认Pre-LN稳定性）
-            print(f"\n【调试-中间变量】LN_Z_batch均值: {LN_Z_batch.mean():.6f}, 标准差: {LN_Z_batch.std():.6f}")
-            print(f"【调试-中间变量】res_2均值: {res_2.mean():.6f}, 标准差: {res_2.std():.6f}")
+            print(f"\n【调试-中间变量】layer0输出均值: {layer_caches[0]['input'].mean():.6f}, 标准差: {layer_caches[0]['input'].std():.6f}")
+            print(f"【调试-中间变量】layer2输出均值: {Z_batch.mean():.6f}, 标准差: {Z_batch.std():.6f}")
             print(f"【调试-中间变量】y_pred均值: {y_pred.mean():.6f}, y_true均值: {y_true.mean():.6f}")
+            
+            print(f"\n【关键诊断】Layer0输出 STD: {layer_caches[0]['input'].std():.4f}")
+            print(f"【关键诊断】Layer2输出 STD: {Z_batch.std():.4f}") 
+            
+            print(f"Layer0_W_1梯度幅值: {np.abs(grads['layer0_W_1']).mean():.6f}")
+            print(f"Layer2_W_1梯度幅值: {np.abs(grads['layer2_W_1']).mean():.6f}")
+            
+            
             grad_print_flag = True
     
     # 验证阶段
@@ -513,32 +563,35 @@ for epoch in range(num_epochs):
             y_true = val_label_batches[batch_idx]
             B_actual = X_batch.shape[0]
             
-            # 验证阶段前向传播（适配Pre-LN和平均池化）
-            W_e, b_e = params['W_e'], params['b_e']
-            W_Q, W_K, W_V, W_O = params['W_Q'], params['W_K'], params['W_V'], params['W_O']
-            W_1, b_1, W_2, b_2 = params['W_1'], params['b_1'], params['W_2'], params['b_2']
-            gamma1, beta1 = params['gamma1'], params['beta1']
-            gamma2, beta2 = params['gamma2'], params['beta2']
-            W_pred, b_pred = params['W_pred'], params['b_pred']
-            
-            E_batch = X_batch @ W_e + b_e
+            # 验证前向传播
+            E_batch = X_batch @ params['W_e'] + params['b_e']
             Z_batch = E_batch + P
             
-            # Pre-LN + MHA
-            LN_Z_batch = LayerNorm(Z_batch, gamma1, beta1)
-            outs_MHA, _, _, _, _, _, _, _, _, _, _, _, _, _ = MHA(
-                LN_Z_batch, W_Q, W_K, W_V, W_O, h, d_K
-            )
-            res_1 = Z_batch + outs_MHA
+            for layer_idx in range(num_layers):
+                W_Q = params[f'layer{layer_idx}_W_Q']
+                W_K = params[f'layer{layer_idx}_W_K']
+                W_V = params[f'layer{layer_idx}_W_V']
+                W_O = params[f'layer{layer_idx}_W_O']
+                W_1 = params[f'layer{layer_idx}_W_1']
+                b_1 = params[f'layer{layer_idx}_b_1']
+                W_2 = params[f'layer{layer_idx}_W_2']
+                b_2 = params[f'layer{layer_idx}_b_2']
+                gamma1 = params[f'layer{layer_idx}_gamma1']
+                beta1 = params[f'layer{layer_idx}_beta1']
+                gamma2 = params[f'layer{layer_idx}_gamma2']
+                beta2 = params[f'layer{layer_idx}_beta2']
+                
+                LN_Z = LayerNorm(Z_batch, gamma1, beta1)
+                outs_MHA, _, _, _, _, _, _, _, _, _, _, _, _, _ = MHA(
+                    LN_Z, W_Q, W_K, W_V, W_O, h, d_K
+                )
+                res1 = Z_batch + outs_MHA
+                LN_res1 = LayerNorm(res1, gamma2, beta2)
+                outs_FFN, _, _ = FFN(LN_res1, W_1, b_1, W_2, b_2)
+                Z_batch = res1 + outs_FFN
             
-            # Pre-LN + FFN
-            LN_res1 = LayerNorm(res_1, gamma2, beta2)
-            outs_FFN, _, _ = FFN(LN_res1, W_1, b_1, W_2, b_2)
-            res_2 = res_1 + outs_FFN
-            
-            # 平均池化回归头
-            final_repr = np.mean(res_2, axis=1)
-            y_pred = (final_repr @ W_pred + b_pred).squeeze(-1)
+            final_repr = np.mean(Z_batch, axis=1)
+            y_pred = (final_repr @ params['W_pred'] + params['b_pred']).squeeze(-1)
             
             loss = np.mean((y_pred - y_true) ** 2)
             val_total_loss += loss * B_actual
@@ -548,10 +601,6 @@ for epoch in range(num_epochs):
     avg_train_loss = train_total_loss / train_total_samples
     avg_val_loss = val_total_loss / val_total_samples if val_total_samples > 0 else float('inf')
     epoch_time = time.time() - epoch_start_time
-    
-    # 【新增调试】每个Epoch打印参数更新后的统计
-    print(f"\n【调试-Epoch{epoch+1}参数】W_1均值: {params['W_1'].mean():.6f}, W_2均值: {params['W_2'].mean():.6f}")
-    print(f"【调试-Epoch{epoch+1}参数】W_pred均值: {params['W_pred'].mean():.6f}, b_pred: {params['b_pred'][0]:.6f}")
     
     # 保存最优模型
     if avg_val_loss < best_val_loss:
@@ -581,4 +630,4 @@ np.savez("./model/transformer_params.npz",
          **params,
          mean_X_train=mean_X_train, std_X_train=std_X_train,
          mean_Y_train=mean_Y_train, std_Y_train=std_Y_train)
-print("模型已保存到 ./model/，包含训练集归一化统计量")
+print("模型已保存到 ./model/，包含三层Transformer参数和归一化统计量")
