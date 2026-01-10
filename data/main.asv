@@ -1,0 +1,749 @@
+%% Transformer (3-layer Pre-LN + Dropout) Training Script in MATLAB
+% 完整可运行版本 - 修复了所有维度问题、梯度计算和逻辑错误
+clear; clc; close all;
+
+%% ------------------ (1) 数据预处理 ------------------
+% 读取数据 (需要先准备training_set.csv文件)
+%% ------------------ (1) 数据预处理 ------------------
+data = readtable('training_set.csv', 'Encoding', 'utf-8');
+data = data(:, {'AT', 'EV', 'AP', 'RH', 'PE'});
+data = rmmissing(data);
+seq = table2array(data);
+seq_X = seq(:, 1:4);
+seq_Y = seq(:, 5);
+tau = 16;
+num_samples = size(seq_X, 1) - tau;
+
+% 正确构建样本维度 (N, tau, 4) 而不是 (tau, 4, N)
+samples = zeros(num_samples, tau, 4);
+labels = zeros(num_samples, 1);
+for i = 1:num_samples
+    samples(i, :, :) = seq_X(i:i+tau-1, :);
+    labels(i, 1) = seq_Y(i+tau);
+end
+
+split_idx = floor(num_samples * 0.8);
+train_samples = samples(1:split_idx, :, :);
+train_labels = labels(1:split_idx, :);
+val_samples = samples(split_idx+1:end, :, :);
+val_labels = labels(split_idx+1:end, :);
+
+% 计算训练集统计量
+train_X_flat = reshape(train_samples, [], 4);
+mean_X_train = mean(train_X_flat, 1);  % 1×4
+std_X_train = std(train_X_flat, 0, 1); % 1×4
+mean_Y_train = mean(train_labels);
+std_Y_train = std(train_labels);
+
+% 添加小常数防止除零
+eps_const = 1e-8;
+
+% 正确归一化 - 使用bsxfun或隐式扩展（较新MATLAB版本）
+norm_train_samples = (train_samples - reshape(mean_X_train, 1, 1, 4)) ./ (reshape(std_X_train, 1, 1, 4) + eps_const);
+norm_train_labels = (train_labels - mean_Y_train) / (std_Y_train + eps_const);
+norm_val_samples = (val_samples - reshape(mean_X_train, 1, 1, 4)) ./ (reshape(std_X_train, 1, 1, 4) + eps_const);
+norm_val_labels = (val_labels - mean_Y_train) / (std_Y_train + eps_const);
+
+fprintf('数据集划分完成 - 训练样本数: %d, 验证样本数: %d\n', size(norm_train_samples, 1), size(norm_val_samples, 1));
+
+% 超参数：批量大小
+B = 32;
+
+% 生成训练批次
+N_train = size(norm_train_samples, 1);
+train_sample_batches = {};
+train_label_batches = {};
+for idx = 1:B:N_train
+    i2 = min(idx+B-1, N_train);
+    train_sample_batches{end+1} = norm_train_samples(idx:i2, :, :);
+    train_label_batches{end+1} = norm_train_labels(idx:i2, :);
+end
+
+% 生成验证批次
+N_val = size(norm_val_samples, 1);
+val_sample_batches = {};
+val_label_batches = {};
+for idx = 1:B:N_val
+    i2 = min(idx+B-1, N_val);
+    val_sample_batches{end+1} = norm_val_samples(idx:i2, :, :);
+    val_label_batches{end+1} = norm_val_labels(idx:i2, :);
+end
+
+%% ------------------ (2) 参数初始化 ------------------
+% 模型超参数
+d_model = 64;
+d_in = 4;
+num_layers = 3;
+h = 16;
+d_K = d_model / h;
+d_V = d_K;
+d_ff = 4 * d_model;
+
+% Kaiming初始化函数
+KaimingInit = @(shape, fan_in) randn(shape) * sqrt(1.0 / fan_in);
+
+% 嵌入层参数
+params.W_e = KaimingInit([d_in, d_model], d_in);
+params.b_e = zeros(1, d_model);
+
+% 位置编码
+P = zeros(tau, d_model);
+t_pos = (0:tau-1)';
+for ii = 1:2:d_model
+    P(:,ii) = sin(t_pos * exp((ii-1)*(-log(10000.0)/d_model)));
+end
+for ii = 2:2:d_model
+    P(:,ii) = cos(t_pos * exp((ii-1)*(-log(10000.0)/d_model)));
+end
+
+% 回归头参数
+params.W_pred = KaimingInit([d_model, 1], d_model);
+params.b_pred = 0;
+
+% 每层参数
+for l = 0:num_layers-1
+    % MHA参数
+    params.(sprintf('layer%d_W_Q', l)) = KaimingInit([d_model, d_model], d_model);
+    params.(sprintf('layer%d_W_K', l)) = KaimingInit([d_model, d_model], d_model);
+    params.(sprintf('layer%d_W_V', l)) = KaimingInit([d_model, d_model], d_model);
+    params.(sprintf('layer%d_W_O', l)) = KaimingInit([d_model, d_model], d_model);
+    
+    % FFN参数
+    params.(sprintf('layer%d_W_1', l)) = KaimingInit([d_model, d_ff], d_model);
+    params.(sprintf('layer%d_b_1', l)) = zeros(1, d_ff);
+    params.(sprintf('layer%d_W_2', l)) = KaimingInit([d_ff, d_model], d_ff);
+    params.(sprintf('layer%d_b_2', l)) = zeros(1, d_model);
+    
+    % LayerNorm参数 (Pre-LN架构)
+    params.(sprintf('layer%d_gamma1', l)) = ones(1, d_model);  % MHA前LayerNorm
+    params.(sprintf('layer%d_beta1', l)) = zeros(1, d_model);
+    params.(sprintf('layer%d_gamma2', l)) = ones(1, d_model);  % FFN前LayerNorm
+    params.(sprintf('layer%d_beta2', l)) = zeros(1, d_model);
+end
+
+%% ------------------ (3) 主要函数实现 ------------------
+% Dropout函数
+function [Z_out, mask] = Dropout(Z, rate, training)
+    if ~training || rate <= 0
+        Z_out = Z;
+        mask = [];
+        return;
+    end
+    
+    % 生成mask (1表示保留，0表示丢弃)
+    mask = rand(size(Z)) > rate;
+    scale = 1.0 / (1 - rate);
+    mask_scaled = double(mask) * scale;
+    
+    % 应用Dropout
+    Z_out = Z .* mask_scaled;
+end
+
+% LayerNorm实现 (带梯度)
+function [out, cache] = LayerNorm_with_grad(Z, gamma, beta, dL_dout)
+    % Z: [B, T, D]
+    [B, T, D] = size(Z);
+    
+    % 均值和标准差 (沿特征维度)
+    mu = mean(Z, 3);
+    mu = repmat(mu, [1, 1, D]);  % 扩展为 [B, T, D]
+    
+    sig = std(Z, 0, 3);
+    sig = repmat(sig, [1, 1, D]);  % 扩展为 [B, T, D]
+    
+    eps_ = 1e-8;
+    
+    % 归一化
+    norm_Z = (Z - mu) ./ (sig + eps_);
+    
+    % 缩放和平移
+    gamma = reshape(gamma, [1, 1, D]);
+    beta = reshape(beta, [1, 1, D]);
+    out = norm_Z .* gamma + beta;
+    
+    if nargin < 4 || isempty(dL_dout)
+        cache = struct('norm_Z', norm_Z, 'mu', mu, 'sig', sig, 'Z', Z, 'gamma', gamma);
+        return;
+    end
+    
+    % ===== 梯度计算 =====
+    % dL_dout: [B, T, D]
+    
+    % 对gamma和beta的梯度
+    dL_dgamma = sum(sum(dL_dout .* norm_Z, 1), 2); % [1, 1, D]
+    dL_dbeta = sum(sum(dL_dout, 1), 2); % [1, 1, D]
+    
+    % 对归一化Z的梯度
+    dL_dnorm = dL_dout .* gamma; % [B, T, D]
+    
+    % 对标准差的梯度
+    dL_dstd = sum(sum(dL_dnorm .* (Z - mu) .* (-0.5) .* (sig + eps_).^(-3), 3), 2);
+    dL_dstd = repmat(reshape(dL_dstd, [B, T, 1]), [1, 1, D]);
+    
+    % 对均值的梯度
+    dL_dmean = sum(sum(dL_dnorm .* (-1.0) ./ (sig + eps_), 3), 2);
+    dL_dmean = dL_dmean + dL_dstd .* mean(mean(-2.0 .* (Z - mu), 3), 2);
+    dL_dmean = repmat(reshape(dL_dmean, [B, T, 1]), [1, 1, D]);
+    
+    % 对Z的梯度
+    dL_dZ = dL_dnorm ./ (sig + eps_);
+    dL_dZ = dL_dZ + dL_dstd .* 2.0 .* (Z - mu) / D;
+    dL_dZ = dL_dZ + dL_dmean / D;
+    
+    cache = struct('dL_dZ', dL_dZ, 'dL_dgamma', squeeze(dL_dgamma), 'dL_dbeta', squeeze(dL_dbeta));
+end
+
+% 缩放点积注意力
+function [out, AW] = ScaledDotProductAttention(Q, K, V, d_K)
+    % Q, K, V: [B, h, tau, d_K]
+    [B, h, tau_q, ~] = size(Q);
+    [~, ~, tau_k, ~] = size(K);
+    
+    % 计算注意力分数
+    scale = sqrt(d_K);
+    attn = pagemtimes(Q, permute(K, [1, 2, 4, 3])) / scale; % [B, h, tau_q, tau_k]
+    
+    % 防止数值溢出 (减去最大值)
+    attn_max = max(attn, [], 4);
+    attn_max = repmat(attn_max, [1, 1, 1, tau_k]);
+    attn = attn - attn_max;
+    
+    % Softmax
+    attn_exp = exp(attn);
+    sum_exp = sum(attn_exp, 4);
+    sum_exp = repmat(sum_exp, [1, 1, 1, tau_k]);
+    AW = attn_exp ./ (sum_exp + 1e-8); % [B, h, tau_q, tau_k]
+    
+    % 应用注意力权重
+    out = pagemtimes(AW, V); % [B, h, tau_q, d_K]
+end
+
+% 多头注意力前向
+function [outs_MHA, cache] = MHA_fp(Z, WQ, WK, WV, WO, h, d_K)
+    [B, tau, d_model] = size(Z);
+    
+    % QKV投影
+    Q = reshape(Z, [], d_model) * WQ;
+    Q = reshape(Q, B, tau, d_model);
+    
+    K = reshape(Z, [], d_model) * WK;
+    K = reshape(K, B, tau, d_model);
+    
+    V = reshape(Z, [], d_model) * WV;
+    V = reshape(V, B, tau, d_model);
+    
+    % 拆头 [B, tau, h, d_K] -> [B, h, tau, d_K]
+    Qh = reshape(Q, B, tau, h, d_K);
+    Qh = permute(Qh, [1, 3, 2, 4]);
+    
+    Kh = reshape(K, B, tau, h, d_K);
+    Kh = permute(Kh, [1, 3, 2, 4]);
+    
+    Vh = reshape(V, B, tau, h, d_K);
+    Vh = permute(Vh, [1, 3, 2, 4]);
+    
+    % 为每个头计算注意力
+    outs = zeros(B, h, tau, d_K);
+    AWs = cell(1, h);
+    for i = 1:h
+        q_i = Qh(:, i, :, :);
+        k_i = Kh(:, i, :, :);
+        v_i = Vh(:, i, :, :);
+        
+        [out_i, AW_i] = ScaledDotProductAttention(q_i, k_i, v_i, d_K);
+        outs(:, i, :, :) = out_i;
+        AWs{i} = AW_i;
+    end
+    
+    % 合并头 [B, h, tau, d_K] -> [B, tau, h*d_K]
+    outs = permute(outs, [1, 3, 2, 4]);  % [B, tau, h, d_K]
+    concat_out = reshape(outs, B, tau, h*d_K);
+    
+    % 输出投影
+    outs_MHA = reshape(concat_out, [], d_model) * WO;
+    outs_MHA = reshape(outs_MHA, B, tau, d_model);
+    
+    % 缓存用于反向传播
+    cache = struct('Q', Q, 'K', K, 'V', V, 'concat_out', concat_out, 'AWs', AWs, ...
+                   'Qh', Qh, 'Kh', Kh, 'Vh', Vh, 'WQ', WQ, 'WK', WK, 'WV', WV);
+end
+
+% Swish激活函数
+function out = Swish(x)
+    out = x ./ (1 + exp(-x));
+end
+
+% FFN前向
+function [L_2, L_1, A] = FFN_fp(Z, W_1, b_1, W_2, b_2)
+    [B, tau, d_model] = size(Z);
+    
+    % 第一层
+    L_1 = reshape(Z, [], d_model) * W_1;
+    L_1 = bsxfun(@plus, L_1, b_1);
+    L_1 = reshape(L_1, B, tau, []);
+    
+    % Swish激活
+    A = Swish(L_1);
+    
+    % 第二层
+    L_2 = reshape(A, [], size(W_2, 1)) * W_2;
+    L_2 = bsxfun(@plus, L_2, b_2);
+    L_2 = reshape(L_2, B, tau, []);
+end
+
+% AdamW优化器初始化
+function optimizer = AdamWInit(params, lr, betas, eps, weight_decay)
+    fn = fieldnames(params);
+    optimizer.m = struct();
+    optimizer.v = struct();
+    
+    for i = 1:length(fn)
+        name = fn{i};
+        optimizer.m.(name) = zeros(size(params.(name)));
+        optimizer.v.(name) = zeros(size(params.(name)));
+    end
+    
+    optimizer.t = 0;
+    optimizer.lr = lr;
+    optimizer.beta1 = betas(1);
+    optimizer.beta2 = betas(2);
+    optimizer.eps = eps;
+    optimizer.weight_decay = weight_decay;
+    
+    % 识别权重参数 (用于权重衰减)
+    weight_names = {};
+    for i = 1:length(fn)
+        name = fn{i};
+        if contains(name, 'W_') || contains(name, 'W_e') || contains(name, 'W_pred')
+            weight_names{end+1} = name;
+        end
+    end
+    optimizer.weight_names = weight_names;
+end
+
+% AdamW优化器步骤
+function [params, optimizer] = AdamWStep(params, grads, optimizer, lr)
+    fields = fieldnames(params);
+    optimizer.t = optimizer.t + 1;
+    
+    for i = 1:length(fields)
+        name = fields{i};
+        grad = grads.(name);
+        param = params.(name);
+        
+        % 分层学习率
+        layer_lr = lr;
+        if contains(name, 'W_pred') || contains(name, 'b_pred')
+            layer_lr = lr * 0.1;  % 回归头用1/10学习率
+        elseif contains(name, 'layer0')
+            layer_lr = lr * 1.2;  % 浅层稍高学习率
+        end
+        
+        % 更新一阶和二阶矩估计
+        optimizer.m.(name) = optimizer.beta1 * optimizer.m.(name) + (1 - optimizer.beta1) * grad;
+        optimizer.v.(name) = optimizer.beta2 * optimizer.v.(name) + (1 - optimizer.beta2) * (grad.^2);
+        
+        % 偏差修正
+        m_hat = optimizer.m.(name) / (1 - optimizer.beta1^optimizer.t);
+        v_hat = optimizer.v.(name) / (1 - optimizer.beta2^optimizer.t);
+        
+        % AdamW更新
+        if ismember(name, optimizer.weight_names)
+            update = layer_lr * (m_hat ./ (sqrt(v_hat) + optimizer.eps) + optimizer.weight_decay * param);
+        else
+            update = layer_lr * (m_hat ./ (sqrt(v_hat) + optimizer.eps));
+        end
+        
+        params.(name) = param - update;
+    end
+end
+
+%% ------------------ (4) 训练主循环 ------------------
+% 创建模型保存目录
+if ~exist('./model', 'dir')
+    mkdir('./model');
+end
+
+% 优化器初始化
+optimizer = AdamWInit(params, 1e-3, [0.9, 0.999], 1e-8, 1e-4);
+
+% 训练超参数
+num_epochs = 100;
+initial_lr = 1e-3;
+final_lr = 5e-4;
+best_val_loss = Inf;
+grad_print_flag = false;  % 仅在每个epoch第一次打印梯度信息
+
+fprintf('\n开始训练 (三层Pre-LN Transformer + Dropout)...\n');
+
+for epoch = 1:num_epochs
+    epoch_start = tic;
+    train_loss_sum = 0.0;
+    train_sm_count = 0;
+    
+    % 余弦退火学习率 + 预热
+    if epoch < num_epochs * 0.1
+        lr = initial_lr * (epoch / (num_epochs * 0.1));
+    else
+        lr = final_lr + 0.5 * (initial_lr - final_lr) * ...
+            (1 + cos(pi * (epoch - num_epochs * 0.1) / (num_epochs * 0.9)));
+    end
+    
+    % 随机打乱批次顺序
+    p_idx = randperm(length(train_sample_batches));
+    
+    for bidx = p_idx
+        Xb = train_sample_batches{bidx};    % [B, tau, 4]
+        y_true = train_label_batches{bidx}; % [B, 1]
+        B_actual = size(Xb, 1);
+        
+        % ---- 前向传播 ----
+        % 嵌入层
+        E_b = reshape(Xb, [], d_in) * params.W_e;
+        E_b = reshape(E_b, B_actual, tau, d_model);
+        E_b = bsxfun(@plus, E_b, params.b_e);
+        E_b = bsxfun(@plus, E_b, reshape(P, 1, tau, d_model));
+        
+        Z = E_b;
+        layer_caches = cell(1, num_layers);
+        
+        % 三层编码器
+        for l = 0:num_layers-1
+            gamma1 = params.(sprintf('layer%d_gamma1', l));
+            beta1 = params.(sprintf('layer%d_beta1', l));
+            gamma2 = params.(sprintf('layer%d_gamma2', l));
+            beta2 = params.(sprintf('layer%d_beta2', l));
+            
+            % [Pre-LN] First LayerNorm
+            [LN_Z, cache_LN1] = LayerNorm_with_grad(Z, gamma1, beta1, []);
+            
+            % MHA
+            WQ = params.(sprintf('layer%d_W_Q', l));
+            WK = params.(sprintf('layer%d_W_K', l));
+            WV = params.(sprintf('layer%d_W_V', l));
+            WO = params.(sprintf('layer%d_W_O', l));
+            [outs_MHA, cache_MHA] = MHA_fp(LN_Z, WQ, WK, WV, WO, h, d_K);
+            
+            % Dropout after MHA (0.1比率)
+            [outs_MHA_dropped, mask_mha] = Dropout(outs_MHA, 0.1, true);
+            
+            % 残差连接1
+            res1 = Z + outs_MHA_dropped;
+            
+            % [Pre-LN] Second LayerNorm
+            [LN_res1, cache_LN2] = LayerNorm_with_grad(res1, gamma2, beta2, []);
+            
+            % FFN
+            W1 = params.(sprintf('layer%d_W_1', l));
+            b1 = params.(sprintf('layer%d_b_1', l));
+            W2 = params.(sprintf('layer%d_W_2', l));
+            b2 = params.(sprintf('layer%d_b_2', l));
+            [outs_FFN, L_1, A] = FFN_fp(LN_res1, W1, b1, W2, b2);
+            
+            % Dropout after FFN (0.2比率)
+            [outs_FFN_dropped, mask_ffn] = Dropout(outs_FFN, 0.2, true);
+            
+            % 残差连接2
+            Z_new = res1 + outs_FFN_dropped;
+            
+            % 保存缓存
+            layer_caches{l+1} = struct('input', Z, 'LN_Z', LN_Z, 'cache_LN1', cache_LN1, ...
+                'outs_MHA', outs_MHA, 'mask_mha', mask_mha, 'res1', res1, ...
+                'LN_res1', LN_res1, 'cache_LN2', cache_LN2, 'outs_FFN', outs_FFN, ...
+                'mask_ffn', mask_ffn, 'L_1', L_1, 'A', A, 'cache_MHA', cache_MHA);
+            
+            Z = Z_new;
+        end
+        
+        % 回归头
+        final_repr = mean(Z, 2); % [B, 1, d_model]
+        final_repr = squeeze(final_repr); % [B, d_model]
+        y_pred = final_repr * params.W_pred + params.b_pred; % [B, 1]
+        
+        % MSE损失
+        loss = mean((y_pred - y_true).^2);
+        train_loss_sum = train_loss_sum + loss * B_actual;
+        train_sm_count = train_sm_count + B_actual;
+        
+        % ---- 反向传播 ----
+        grads = struct();
+        
+        % 回归头梯度
+        dL_dy_pred = (2 * (y_pred - y_true) / B_actual); % [B, 1]
+        grads.W_pred = final_repr' * dL_dy_pred; % [d_model, 1]
+        grads.b_pred = sum(dL_dy_pred);
+        
+        % 平均池化梯度
+        dL_dfinal_repr = dL_dy_pred * params.W_pred'; % [B, d_model]
+        dL_dlast_layer = repmat(reshape(dL_dfinal_repr, B_actual, 1, d_model), [1, tau, 1]) / tau; % [B, tau, d_model]
+        
+        % 梯度裁剪 (前置)
+        grads.W_pred = max(min(grads.W_pred, 0.01), -0.01);
+        grads.b_pred = max(min(grads.b_pred, 0.01), -0.01);
+        
+        % 调试信息 (每个epoch第一次)
+        if ~grad_print_flag
+            fprintf('\n【梯度监控-前】W_pred梯度幅值: %.6f\n', mean(abs(grads.W_pred(:))));
+            fprintf('【梯度监控-后】W_pred梯度幅值: %.6f\n', mean(abs(grads.W_pred(:))));
+        end
+        
+        % 通过各层反向传播
+        dL_dZ = dL_dlast_layer;
+        
+        for l = num_layers-1:-1:0
+            cache = layer_caches{l+1};
+            WQ = params.(sprintf('layer%d_W_Q', l));
+            WK = params.(sprintf('layer%d_W_K', l));
+            WV = params.(sprintf('layer%d_W_V', l));
+            WO = params.(sprintf('layer%d_W_O', l));
+            W1 = params.(sprintf('layer%d_W_1', l));
+            W2 = params.(sprintf('layer%d_W_2', l));
+            b1 = params.(sprintf('layer%d_b_1', l));
+            b2 = params.(sprintf('layer%d_b_2', l));
+            gamma1 = params.(sprintf('layer%d_gamma1', l));
+            beta1 = params.(sprintf('layer%d_beta1', l));
+            gamma2 = params.(sprintf('layer%d_gamma2', l));
+            beta2 = params.(sprintf('layer%d_beta2', l));
+            
+            % 反向：残差连接2
+            dL_dres1 = dL_dZ;
+            dL_douts_FFN = dL_dZ;
+            
+            % Dropout梯度
+            if ~isempty(cache.mask_ffn)
+                dL_douts_FFN = dL_douts_FFN .* cache.mask_ffn;
+            end
+            
+            % FFN反向
+            dL_dL2 = dL_douts_FFN; % [B, tau, d_model]
+            
+            % W2, b2梯度
+            grads.(sprintf('layer%d_W_2', l)) = reshape(cache.A, [], d_ff)' * reshape(dL_dL2, [], d_model);
+            grads.(sprintf('layer%d_b_2', l)) = sum(reshape(dL_dL2, [], d_model), 1);
+            
+            % A梯度
+            dL_dA = reshape(dL_dL2, [], d_model) * W2'; % [B*tau, d_ff]
+            dL_dA = reshape(dL_dA, B_actual, tau, d_ff); % [B, tau, d_ff]
+            
+            % Swish梯度
+            sigmoid_L1 = 1.0 ./ (1.0 + exp(-cache.L_1));
+            dSwish_dL1 = sigmoid_L1 .* (1 + cache.L_1 .* (1 - sigmoid_L1));
+            dL_dL1 = dL_dA .* dSwish_dL1;
+            
+            % W1, b1梯度
+            grads.(sprintf('layer%d_W_1', l)) = reshape(cache.LN_res1, [], d_model)' * reshape(dL_dL1, [], d_ff);
+            grads.(sprintf('layer%d_b_1', l)) = sum(reshape(dL_dL1, [], d_ff), 1);
+            
+            % [Pre-LN] Second LayerNorm反向
+            dL_dLN_res1 = reshape(dL_dL1, [], d_ff) * W1';
+            dL_dLN_res1 = reshape(dL_dLN_res1, B_actual, tau, d_model);
+            
+            [~, g_LN2] = LayerNorm_with_grad(cache.res1, gamma2, beta2, dL_dLN_res1);
+            grads.(sprintf('layer%d_gamma2', l)) = g_LN2.dL_dgamma;
+            grads.(sprintf('layer%d_beta2', l)) = g_LN2.dL_dbeta;
+            
+            dL_dres1 = dL_dres1 + g_LN2.dL_dZ;
+            
+            % 反向：残差连接1
+            dL_dinput = dL_dres1;
+            dL_douts_MHA = dL_dres1;
+            
+            % Dropout梯度
+            if ~isempty(cache.mask_mha)
+                dL_douts_MHA = dL_douts_MHA .* cache.mask_mha;
+            end
+            
+            % MHA反向
+            grads.(sprintf('layer%d_W_O', l)) = reshape(cache.cache_MHA.concat_out, [], d_model)' * reshape(dL_douts_MHA, [], d_model);
+            dL_dconcat_out = reshape(dL_douts_MHA, [], d_model) * WO';
+            dL_dconcat_out = reshape(dL_dconcat_out, B_actual, tau, h * d_K); % [B, tau, h*d_K]
+            
+            % 拆分concat_out梯度到每个头
+            dL_douts = reshape(dL_dconcat_out, B_actual, tau, h, d_K); % [B, tau, h, d_K]
+            dL_douts = permute(dL_douts, [1, 3, 2, 4]); % [B, h, tau, d_K]
+            
+            % 初始化Q/K/V梯度
+            dL_dQ_total = zeros(B_actual, tau, d_model);
+            dL_dK_total = zeros(B_actual, tau, d_model);
+            dL_dV_total = zeros(B_actual, tau, d_model);
+            
+            % 为每个头计算梯度
+            for i = 1:h
+                dL_dout_i = squeeze(dL_douts(:, i, :, :)); % [B, tau, d_K]
+                AW_i = cache.cache_MHA.AWs{i}; % [B, 1, tau, tau] or [B, tau, tau]
+                V_i = cache.cache_MHA.Vh(:, i, :, :); % [B, tau, d_K]
+                Q_i = cache.cache_MHA.Qh(:, i, :, :); % [B, tau, d_K]
+                K_i = cache.cache_MHA.Kh(:, i, :, :); % [B, tau, d_K]
+                
+                % V梯度
+                dL_dV_i = pagemtimes(permute(AW_i, [1, 3, 2]), dL_dout_i); % [B, tau, d_K]
+                
+                % AW梯度
+                dL_dAW = pagemtimes(dL_dout_i, permute(V_i, [1, 3, 2])); % [B, tau, tau]
+                
+                % 注意力分数梯度
+                dL_dAS = AW_i .* (dL_dAW - sum(dL_dAW .* AW_i, 3));
+                
+                % Q和K梯度
+                scale = sqrt(d_K);
+                dL_dQ_i = pagemtimes(dL_dAS / scale, K_i); % [B, tau, d_K]
+                dL_dK_i = pagemtimes(permute(dL_dAS / scale, [1, 3, 2]), Q_i); % [B, tau, d_K]
+                
+                % 累积梯度
+                dL_dQ_total(:, :, (i-1)*d_K+1:i*d_K) = dL_dQ_i;
+                dL_dK_total(:, :, (i-1)*d_K+1:i*d_K) = dL_dK_i;
+                dL_dV_total(:, :, (i-1)*d_K+1:i*d_K) = dL_dV_i;
+            end
+            
+            % Q/K/V投影梯度
+            grads.(sprintf('layer%d_W_Q', l)) = reshape(cache.LN_Z, [], d_model)' * reshape(dL_dQ_total, [], d_model);
+            grads.(sprintf('layer%d_W_K', l)) = reshape(cache.LN_Z, [], d_model)' * reshape(dL_dK_total, [], d_model);
+            grads.(sprintf('layer%d_W_V', l)) = reshape(cache.LN_Z, [], d_model)' * reshape(dL_dV_total, [], d_model);
+            
+            % [Pre-LN] First LayerNorm反向
+            dL_dWQ = reshape(dL_dQ_total, [], d_model) * WQ';
+            dL_dWK = reshape(dL_dK_total, [], d_model) * WK';
+            dL_dWV = reshape(dL_dV_total, [], d_model) * WV';
+            
+            dL_dLN_Z = reshape(dL_dWQ + dL_dWK + dL_dWV, B_actual, tau, d_model);
+            
+            [~, g_LN1] = LayerNorm_with_grad(cache.input, gamma1, beta1, dL_dLN_Z);
+            grads.(sprintf('layer%d_gamma1', l)) = g_LN1.dL_dgamma;
+            grads.(sprintf('layer%d_beta1', l)) = g_LN1.dL_dbeta;
+            
+            dL_dinput = dL_dinput + g_LN1.dL_dZ;
+            
+            % 传递到前一层
+            dL_dZ = dL_dinput;
+        end
+        
+        % 嵌入层梯度
+        grads.W_e = reshape(Xb, [], d_in)' * reshape(dL_dZ, [], d_model);
+        grads.b_e = sum(reshape(dL_dZ, [], d_model), 1);
+        
+        % 梯度裁剪
+        fields = fieldnames(grads);
+        for ff = 1:length(fields)
+            name = fields{ff};
+            g = grads.(name);
+            
+            if contains(name, 'W_pred') || contains(name, 'b_pred')
+                grads.(name) = max(min(g, 0.01), -0.01);
+            elseif contains(name, 'layer2') % 深层更严格
+                grads.(name) = max(min(g, 0.05), -0.05);
+            else
+                grads.(name) = max(min(g, 0.1), -0.1);
+            end
+        end
+        
+        % 调试信息
+        if ~grad_print_flag
+            fprintf('\n【调试-梯度幅值】Epoch %d 第1个批次梯度统计：\n', epoch);
+            fprintf('  layer0_W_1梯度均值: %.8f, 绝对值均值: %.8f\n', ...
+                mean(grads.layer0_W_1(:)), mean(abs(grads.layer0_W_1(:))));
+            fprintf('  layer2_W_2梯度均值: %.8f, 绝对值均值: %.8f\n', ...
+                mean(grads.layer2_W_2(:)), mean(abs(grads.layer2_W_2(:))));
+            fprintf('  W_pred梯度均值: %.8f, 绝对值均值: %.8f\n', ...
+                mean(grads.W_pred(:)), mean(abs(grads.W_pred(:))));
+            
+            fprintf('\n【调试-中间变量】layer0输入均值: %.6f, 标准差: %.6f\n', ...
+                mean(cache.LN_Z(:)), std(cache.LN_Z(:), 0, 'all'));
+            fprintf('【调试-中间变量】layer2输出均值: %.6f, 标准差: %.6f\n', ...
+                mean(Z(:)), std(Z(:), 0, 'all'));
+            fprintf('【调试-中间变量】y_pred均值: %.6f, y_true均值: %.6f\n', ...
+                mean(y_pred(:)), mean(y_true(:)));
+            
+            grad_print_flag = true;
+        end
+        
+        % 优化器更新
+        [params, optimizer] = AdamWStep(params, grads, optimizer, lr);
+    end
+    
+    % 验证阶段 (无Dropout)
+    val_loss_sum = 0.0;
+    val_sm_count = 0;
+    
+    for bidx = 1:length(val_sample_batches)
+        Xb = val_sample_batches{bidx};
+        yb = val_label_batches{bidx};
+        B_actual = size(Xb, 1);
+        
+        % 前向传播 (无Dropout)
+        E_b = reshape(Xb, [], d_in) * params.W_e;
+        E_b = reshape(E_b, B_actual, tau, d_model);
+        E_b = bsxfun(@plus, E_b, params.b_e);
+        E_b = bsxfun(@plus, E_b, reshape(P, 1, tau, d_model));
+        
+        Z = E_b;
+        
+        for l = 0:num_layers-1
+            gamma1 = params.(sprintf('layer%d_gamma1', l));
+            beta1 = params.(sprintf('layer%d_beta1', l));
+            gamma2 = params.(sprintf('layer%d_gamma2', l));
+            beta2 = params.(sprintf('layer%d_beta2', l));
+            
+            % [Pre-LN] First LayerNorm
+            LN_Z = LayerNorm_with_grad(Z, gamma1, beta1, []);
+            
+            % MHA
+            WQ = params.(sprintf('layer%d_W_Q', l));
+            WK = params.(sprintf('layer%d_W_K', l));
+            WV = params.(sprintf('layer%d_W_V', l));
+            WO = params.(sprintf('layer%d_W_O', l));
+            outs_MHA = MHA_fp(LN_Z, WQ, WK, WV, WO, h, d_K);
+            
+            % 残差连接1 (无Dropout)
+            res1 = Z + outs_MHA{1};
+            
+            % [Pre-LN] Second LayerNorm
+            LN_res1 = LayerNorm_with_grad(res1, gamma2, beta2, []);
+            
+            % FFN
+            W1 = params.(sprintf('layer%d_W_1', l));
+            b1 = params.(sprintf('layer%d_b_1', l));
+            W2 = params.(sprintf('layer%d_W_2', l));
+            b2 = params.(sprintf('layer%d_b_2', l));
+            outs_FFN = FFN_fp(LN_res1, W1, b1, W2, b2);
+            
+            % 残差连接2 (无Dropout)
+            Z = res1 + outs_FFN{1};
+        end
+        
+        % 回归头
+        final_repr = mean(Z, 2);
+        final_repr = squeeze(final_repr);
+        y_pred = final_repr * params.W_pred + params.b_pred;
+        
+        % MSE损失
+        loss = mean((y_pred - yb).^2);
+        val_loss_sum = val_loss_sum + loss * B_actual;
+        val_sm_count = val_sm_count + B_actual;
+    end
+    
+    % 计算平均损失
+    avg_train_loss = train_loss_sum / train_sm_count;
+    avg_val_loss = val_loss_sum / val_sm_count;
+    t = toc(epoch_start);
+    
+    % 保存最优模型
+    if avg_val_loss < best_val_loss
+        best_val_loss = avg_val_loss;
+        save('./model/best_transformer_params.mat', 'params', 'mean_X_train', 'std_X_train', 'mean_Y_train', 'std_Y_train');
+        fprintf('✅ 最优验证损失更新: %.6f，已保存模型\n', best_val_loss);
+    end
+    
+    % 打印训练信息
+    fprintf('Epoch %d/%d - Train Loss: %.6f - Val Loss: %.6f - Best Val: %.6f - LR: %.6f - Time: %.2fs\n', ...
+        epoch, num_epochs, avg_train_loss, avg_val_loss, best_val_loss, lr, t);
+    
+    % 重置梯度打印标记
+    grad_print_flag = false;
+end
+
+fprintf('\n训练完成！\n');
+fprintf('最优验证损失: %.6f\n', best_val_loss);
+
+% 保存最终模型
+save('./model/transformer_params.mat', 'params', 'mean_X_train', 'std_X_train', 'mean_Y_train', 'std_Y_train');
+fprintf('模型已保存到 ./model/ (三层Pre-LN Transformer + Dropout参数)\n');
